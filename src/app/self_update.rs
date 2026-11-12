@@ -171,8 +171,10 @@ impl SelfUpdate {
         let Some(exe) = &self.exe else { return };
         if self.restart_requested() && with_ext(exe, ".new").exists() {
             let app = exe.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+            let staged = fs::read_to_string(with_ext(exe, ".new.version")).unwrap_or_default();
+            let _ = fs::remove_file(with_ext(exe, ".new.version"));
             let msg = swap_and_start(exe, start_exe).map_or_else(|e| e, |()| "installed on restart".into());
-            log(app, &self.current, "staged", &msg);
+            log(app, &self.current, staged.trim(), &msg);
         }
     }
 }
@@ -265,7 +267,7 @@ fn check(exe: &Path, current: &str, api_url: &str, just_updated: bool, fetch: &F
     }
     let latest = &tag[1..];
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    match download(&release, name, fetch, report).and_then(|bytes| stage(exe, &bytes)) {
+    match download(&release, name, fetch, report).and_then(|bytes| stage(exe, &bytes, latest)) {
         Ok(()) => {
             log(app, current, latest, "staged");
             report(UpdateState::Ready { version: latest.into() });
@@ -312,11 +314,13 @@ fn ok_body(status: i32, body: Vec<u8>, cap: usize, what: &str) -> Result<Vec<u8>
     Ok(body)
 }
 
-/// Writes verified `bytes` as `<exe>.part`, then renames it to `<exe>.new`, so a cut-off write is never staged.
-fn stage(exe: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Writes verified `bytes` as `<exe>.part`, then renames it to `<exe>.new`, so a cut-off write is never staged. The
+/// version goes to `<exe>.new.version` first, so a staged exe always says which version it is.
+fn stage(exe: &Path, bytes: &[u8], version: &str) -> Result<(), String> {
     let (part, new) = (with_ext(exe, ".part"), with_ext(exe, ".new"));
     let res = fs::write(&part, bytes)
         .map_err(|e| format!("write .part: {e}"))
+        .and_then(|()| fs::write(with_ext(exe, ".new.version"), version).map_err(|e| format!("write .version: {e}")))
         .and_then(|()| fs::rename(&part, &new).map_err(|e| format!("rename .part: {e}")));
     if res.is_err() {
         let _ = fs::remove_file(&part);
@@ -331,13 +335,21 @@ fn prepare(exe: &Path, current: &str, enabled: bool, start: impl FnOnce(&Path) -
     let just_updated = cleanup(exe, enabled);
     if enabled && with_ext(exe, ".new").exists() {
         let app = exe.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+        let version_file = with_ext(exe, ".new.version");
+        let staged = fs::read_to_string(&version_file).unwrap_or_default().trim().to_owned();
+        let _ = fs::remove_file(&version_file);
+        // Only ever forward: a stage left from before this exe was replaced by a newer one must not downgrade it.
+        if !is_newer(&format!("v{staged}"), current) {
+            let _ = fs::remove_file(with_ext(exe, ".new"));
+            return Some(just_updated);
+        }
         match swap_and_start(exe, start) {
             Ok(()) => {
-                log(app, current, "staged", "installed at start");
+                log(app, current, &staged, "installed at start");
                 return None;
             }
             Err(e) => {
-                log(app, current, "staged", &e);
+                log(app, current, &staged, &e);
                 let _ = fs::remove_file(with_ext(exe, ".new"));
             }
         }
@@ -596,12 +608,13 @@ mod tests {
     fn self_update_stage_via_part() {
         let exe = temp_exe("stage");
         fs::write(with_ext(&exe, ".new"), b"older stage").unwrap();
-        stage(&exe, b"abc").unwrap();
+        stage(&exe, b"abc", "0.2.0").unwrap();
+        assert_eq!(fs::read_to_string(with_ext(&exe, ".new.version")).unwrap(), "0.2.0");
         assert_eq!(fs::read(with_ext(&exe, ".new")).unwrap(), b"abc");
         assert!(!with_ext(&exe, ".part").exists());
         fs::remove_file(with_ext(&exe, ".new")).unwrap();
         fs::create_dir(with_ext(&exe, ".part")).unwrap(); // the write fails
-        assert!(stage(&exe, b"abc").unwrap_err().contains("write .part"));
+        assert!(stage(&exe, b"abc", "0.2.0").unwrap_err().contains("write .part"));
         assert!(!with_ext(&exe, ".new").exists());
         let _ = fs::remove_dir_all(exe.parent().unwrap());
     }
@@ -611,6 +624,7 @@ mod tests {
         let exe = temp_exe("prepare");
         // disabled: a staged update stays for the copy that is allowed to install it
         fs::write(with_ext(&exe, ".new"), b"new").unwrap();
+        fs::write(with_ext(&exe, ".new.version"), "0.2.0").unwrap();
         assert_eq!(prepare(&exe, "0.1.0", false, |_| panic!("must not start")), Some(false));
         assert!(with_ext(&exe, ".new").exists());
         // enabled: swapped in and started
@@ -629,9 +643,21 @@ mod tests {
         assert!(!with_ext(&exe, ".old").exists());
         // a staged update that will not start is rolled back and deleted
         fs::write(with_ext(&exe, ".new"), b"newer").unwrap();
+        fs::write(with_ext(&exe, ".new.version"), "0.3.0").unwrap();
         assert_eq!(prepare(&exe, "0.2.0", true, |_| Err("start: nope".into())), Some(false));
         assert_eq!(fs::read(&exe).unwrap(), b"new");
         assert!(!with_ext(&exe, ".new").exists() && !with_ext(&exe, ".old").exists());
+        // a stage that is not newer than the running copy (or says no version) is dropped, never installed
+        for v in ["0.2.0", "0.1.9", ""] {
+            fs::write(with_ext(&exe, ".new"), b"older").unwrap();
+            fs::write(with_ext(&exe, ".new.version"), v).unwrap();
+            assert_eq!(
+                prepare(&exe, "0.2.0", true, |_| panic!("must not downgrade")),
+                Some(false)
+            );
+            assert_eq!(fs::read(&exe).unwrap(), b"new");
+            assert!(!with_ext(&exe, ".new").exists() && !with_ext(&exe, ".new.version").exists());
+        }
         let _ = fs::remove_dir_all(exe.parent().unwrap());
     }
 

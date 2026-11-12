@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmapSource, IWICImagingFactory, WICBitmapCacheOnLoad,
-    WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    WICBitmapDitherTypeNone, WICBitmapLockWrite, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
 use windows::Win32::UI::WindowsAndMessaging::HICON;
@@ -161,8 +161,21 @@ pub(crate) fn text_format(font: &LOGFONTW) -> Option<IDWriteTextFormat> {
     .ok()
 }
 
-/// An image file decoded into memory (premultiplied BGRA), with no lock left on the file. None when unreadable.
-pub(crate) fn load_image(file: &Path) -> Option<IWICBitmapSource> {
+/// Recolors premultiplied BGRA pixels to `tint` (0xRRGGBB) at each pixel's own brightness (its strongest channel), so
+/// shape and shading stay: how a game shows a recolored item. Premultiplied stays valid: no channel exceeds alpha.
+pub(crate) fn tint_pixels(px: &mut [u8], tint: u32) {
+    let [_, r, g, b] = tint.to_be_bytes();
+    for p in px.as_chunks_mut::<4>().0 {
+        let v = u32::from(p[0].max(p[1]).max(p[2]));
+        p[0] = (u32::from(b) * v / 255) as u8;
+        p[1] = (u32::from(g) * v / 255) as u8;
+        p[2] = (u32::from(r) * v / 255) as u8;
+    }
+}
+
+/// An image file decoded into memory (premultiplied BGRA), with no lock left on the file, recolored to `tint`
+/// (0xRRGGBB, tint_pixels) when given. None when unreadable.
+pub(crate) fn load_image(file: &Path, tint: Option<u32>) -> Option<IWICBitmapSource> {
     let wic = wic_factory()?;
     if file.as_os_str().is_empty() {
         return None;
@@ -184,9 +197,16 @@ pub(crate) fn load_image(file: &Path) -> Option<IWICBitmapSource> {
             )
             .ok()?;
         // decoded now: file closed
-        wic.CreateBitmapFromSource(&converter, WICBitmapCacheOnLoad)
-            .ok()
-            .map(Into::into)
+        let bitmap = wic.CreateBitmapFromSource(&converter, WICBitmapCacheOnLoad).ok()?;
+        if let Some(tint) = tint {
+            let lock = bitmap.Lock(std::ptr::null(), WICBitmapLockWrite.0 as u32).ok()?;
+            let (mut size, mut data) = (0u32, std::ptr::null_mut());
+            lock.GetDataPointer(&mut size, &mut data).ok()?;
+            if !data.is_null() {
+                tint_pixels(std::slice::from_raw_parts_mut(data, size as usize), tint);
+            }
+        }
+        Some(bitmap.into())
     }
 }
 
@@ -599,6 +619,16 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tint_keeps_shading_and_stays_premultiplied() {
+        // BGRA: an opaque orange, a half-transparent white (premultiplied: 128s), a clear pixel
+        let mut px = [0x20, 0x80, 0xff, 0xff, 0x80, 0x80, 0x80, 0x80, 0, 0, 0, 0];
+        tint_pixels(&mut px, 0x0c0fd4);
+        assert_eq!(px[..4], [0xd4, 0x0f, 0x0c, 0xff]); // the orange's brightest channel was full: the tint itself
+        assert_eq!(px[4..8], [0x6a, 0x07, 0x06, 0x80]); // half as bright, never over its alpha
+        assert_eq!(px[8..], [0, 0, 0, 0]);
+    }
     use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_WEIGHT_SEMI_BOLD};
     use windows::Win32::Graphics::Gdi::FW_SEMIBOLD;
 
@@ -674,11 +704,11 @@ mod tests {
             bmp.extend_from_slice(&px.to_le_bytes());
         }
         std::fs::write(&file, &bmp).unwrap();
-        let image = load_image(&file).expect("decoded");
+        let image = load_image(&file, None).expect("decoded");
         let (mut w, mut h) = (0, 0);
         unsafe { image.GetSize(&mut w, &mut h) }.unwrap();
         assert!(w == 2 && h == 1);
         assert!(std::fs::remove_file(&file).is_ok()); // nothing left open on it
-        assert!(load_image(&file).is_none());
+        assert!(load_image(&file, None).is_none());
     }
 }

@@ -340,16 +340,16 @@ pub struct Dashboard<'a> {
     status_detail: RefCell<String>,
     page: Cell<i32>,
     pages: Cell<i32>,
-    page_of: RefCell<Vec<i32>>,                                           // per row
-    ctls: RefCell<Vec<(HWND, HWND)>>,                                     // per row: label (may be null), control
-    boxes: RefCell<Vec<RECT>>, // per row: Number/Text field box (empty for others)
-    slots: RefCell<Vec<RECT>>, // per row: Value picture slot (empty for others)
-    pictures: RefCell<HashMap<i32, (PathBuf, Option<IWICBitmapSource>)>>, // file, image per id
+    page_of: RefCell<Vec<i32>>,       // per row
+    ctls: RefCell<Vec<(HWND, HWND)>>, // per row: label (may be null), control
+    boxes: RefCell<Vec<RECT>>,        // per row: Number/Text field box (empty for others)
+    slots: RefCell<Vec<RECT>>,        // per row: Value picture slot (empty for others)
+    pictures: RefCell<HashMap<i32, (PathBuf, Option<u32>, Option<IWICBitmapSource>)>>, // file, tint, image per id
     cards: RefCell<Vec<(i32, RECT)>>, // page, rect
     looks: RefCell<HashMap<isize, Look>>, // by HWND
     shown: RefCell<HashMap<i32, String>>, // last text per control id
     numbers: RefCell<HashMap<i32, i32>>, // last value set/applied per Number id
-    setting_tree: Cell<bool>,  // lets set_tree's own check changes through TVN_ITEMCHANGING
+    setting_tree: Cell<bool>,         // lets set_tree's own check changes through TVN_ITEMCHANGING
     trees: RefCell<HashMap<i32, TreeState>>,
     _pin: PhantomPinned, // the window keeps a pointer to it
 }
@@ -637,19 +637,20 @@ impl<'a> Dashboard<'a> {
         let _ = unsafe { SetDlgItemInt(self.hwnd.get(), id, value as u32, true) };
     }
 
-    /// A Value row's picture: an image file (PNG, JPEG, BMP...) fitted into its slot; empty clears it. Reads the file
-    /// only when the path changes, and keeps no lock on it. False when nothing is shown (empty, missing, unreadable).
-    pub fn set_picture(&self, id: i32, file: &Path) -> bool {
+    /// A Value row's picture: an image file (PNG, JPEG, BMP...) fitted into its slot, recolored to `tint` (0xRRGGBB)
+    /// when given; empty clears it. Reads the file only when the path or tint changes, and keeps no lock on it. False
+    /// when nothing is shown (empty, missing, unreadable).
+    pub fn set_picture(&self, id: i32, file: &Path, tint: Option<u32>) -> bool {
         {
             let mut pictures = self.pictures.borrow_mut();
-            let (shown, image) = pictures.entry(id).or_default();
-            if shown == file {
+            let (shown, shown_tint, image) = pictures.entry(id).or_default();
+            if shown == file && *shown_tint == tint {
                 return image.is_some();
             }
         }
-        let image = load_image(file); // decoded into memory: the file isn't kept open
+        let image = load_image(file, tint); // decoded into memory: the file isn't kept open
         let shown = image.is_some();
-        self.pictures.borrow_mut().insert(id, (file.to_path_buf(), image));
+        self.pictures.borrow_mut().insert(id, (file.to_path_buf(), tint, image));
         let slots = self.slots.borrow().clone();
         for (r, s) in self.spec.rows.iter().zip(&slots) {
             if r.id == id && r.kind == Kind::Value {
@@ -1762,7 +1763,7 @@ impl<'a> Dashboard<'a> {
             if is_empty(s) || page_of[i] != page {
                 continue;
             }
-            let Some((_, Some(img))) = pictures.get(&self.spec.rows[i].id) else {
+            let Some((_, _, Some(img))) = pictures.get(&self.spec.rows[i].id) else {
                 continue;
             };
             let (mut iw, mut ih) = (0u32, 0u32);
@@ -2819,11 +2820,12 @@ mod tests {
         b.extend_from_slice(&[0; 24]);
         b.extend_from_slice(b"\x20\x40\x60\x00");
         std::fs::write(&bmp, &b).unwrap();
-        assert!(d.set_picture(2, &bmp));
-        assert!(d.set_picture(2, &bmp)); // same file: kept
+        assert!(d.set_picture(2, &bmp, None));
+        assert!(d.set_picture(2, &bmp, None)); // same file: kept
+        assert!(d.set_picture(2, &bmp, Some(0x0c0fd4))); // recolored: read again
         assert!(std::fs::remove_file(&bmp).is_ok()); // no lock left on it
-        assert!(!d.set_picture(2, Path::new(""))); // cleared
-        assert!(!d.set_picture(2, &bmp)); // gone now
+        assert!(!d.set_picture(2, Path::new(""), None)); // cleared
+        assert!(!d.set_picture(2, &bmp, None)); // gone now
     }
 
     #[test]

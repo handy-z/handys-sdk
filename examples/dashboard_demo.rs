@@ -54,7 +54,10 @@ fn main() {
 
     let d = Dashboard::new(Spec {
         title: "handy's sdk demo".into(),
-        badge: "v1.2.3".into(),
+        badge: handy_sdk::app::self_update::badge_text(
+            "1.2.3",
+            Some(handy_sdk::app::self_update::UpdateStatus::Latest),
+        ),
         window_class: "handys-sdk-demo-dashboard".into(),
         rows: vec![
             page("Overview"),

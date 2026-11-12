@@ -19,18 +19,43 @@ const DOWNLOAD_TIMEOUT_MS: i32 = 10000;
 const SHA_CAP: usize = 4096;
 const EXE_CAP: usize = 32 * 1024 * 1024;
 
+/// What `update_on_startup` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateStatus {
+    /// A newer version was installed and started: exit at once.
+    Restarting,
+    /// This is the newest release.
+    Latest,
+    /// This copy was just installed by an update (the previous version's leftover was found).
+    Updated,
+    /// The check or the update failed (offline, GitHub error, bad download); details in update.log.
+    Failed,
+}
+
+/// The dashboard badge: `v<version>`, plus ` · latest`, ` · updated` or ` · offline` after a check (None: no check
+/// ran, e.g. a development build or another copy already running).
+pub fn badge_text(version: &str, status: Option<UpdateStatus>) -> String {
+    let tail = match status {
+        Some(UpdateStatus::Latest) => " \u{b7} latest",
+        Some(UpdateStatus::Updated) => " \u{b7} updated",
+        Some(UpdateStatus::Failed) => " \u{b7} offline",
+        Some(UpdateStatus::Restarting) | None => "",
+    };
+    format!("v{version}{tail}")
+}
+
 /// Checks https://api.github.com/repos/<owner>/<repo>/releases/latest. When its tag (v<semver>) is newer than
 /// `current` (the app's CARGO_PKG_VERSION) and it has the assets `<exe_name>` and `<exe_name>.sha256`, downloads the
 /// exe, verifies its SHA-256 against the .sha256 file (first 64 hex chars, case-insensitive), swaps it in place of the
-/// running exe and starts it with the same arguments. Returns true when the new version was started: the caller must
-/// exit at once without starting anything (call it before taking a single-instance mutex, or the new copy finds it
-/// held). Any failure leaves everything as it was, appends one line to `app_data_dir()/update.log`, and returns false.
-pub fn update_on_startup(owner: &str, repo: &str, current: &str) -> bool {
+/// running exe and starts it with the same arguments. On `Restarting` the caller must exit at once without starting
+/// anything (call it before taking a single-instance mutex, or the new copy finds it held). Any failure leaves
+/// everything as it was, appends one line to `app_data_dir()/update.log`, and gives `Failed`.
+pub fn update_on_startup(owner: &str, repo: &str, current: &str) -> UpdateStatus {
     let Ok(exe) = std::env::current_exe() else {
         log("?", current, "?", "current_exe failed");
-        return false;
+        return UpdateStatus::Failed;
     };
-    cleanup(&exe);
+    let just_updated = cleanup(&exe);
     let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let app = exe.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
 
@@ -41,22 +66,26 @@ pub fn update_on_startup(owner: &str, repo: &str, current: &str) -> bool {
         Ok(r) => r,
         Err(e) => {
             log(app, current, "?", &e);
-            return false;
+            return UpdateStatus::Failed;
         }
     };
     let tag = release["tag_name"].as_str().unwrap_or_default();
     if !is_newer(tag, current) {
-        return false;
+        return if just_updated {
+            UpdateStatus::Updated
+        } else {
+            UpdateStatus::Latest
+        };
     }
     let latest = &tag[1..];
     match install(&release, name, &exe) {
         Ok(()) => {
             log(app, current, latest, "ok");
-            true
+            UpdateStatus::Restarting
         }
         Err(e) => {
             log(app, current, latest, &e);
-            false
+            UpdateStatus::Failed
         }
     }
 }
@@ -107,13 +136,16 @@ fn with_ext(exe: &Path, ext: &str) -> PathBuf {
 
 /// Deletes `<exe>.old` and `<exe>.new`. The old process may still be exiting (a running exe cannot be deleted), so
 /// this retries for up to 2 s in all, then gives up silently.
-fn cleanup(exe: &Path) {
+/// Deletes an update's leftovers; true when the previous version's `.old` was there, i.e. this copy was just installed.
+fn cleanup(exe: &Path) -> bool {
+    let just_updated = with_ext(exe, ".old").exists();
     let deadline = Instant::now() + Duration::from_secs(2);
     for p in [with_ext(exe, ".old"), with_ext(exe, ".new")] {
         while p.exists() && fs::remove_file(&p).is_err() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    just_updated
 }
 
 /// Puts `bytes` in place of `exe` (Windows allows renaming a running exe) and calls `start` on it. On any failure the
@@ -338,15 +370,27 @@ mod tests {
     }
 
     #[test]
+    fn self_update_badge_text() {
+        assert_eq!(badge_text("0.1.1", None), "v0.1.1");
+        assert_eq!(badge_text("0.1.1", Some(UpdateStatus::Latest)), "v0.1.1 \u{b7} latest");
+        assert_eq!(
+            badge_text("0.1.1", Some(UpdateStatus::Updated)),
+            "v0.1.1 \u{b7} updated"
+        );
+        assert_eq!(badge_text("0.1.1", Some(UpdateStatus::Failed)), "v0.1.1 \u{b7} offline");
+        assert_eq!(badge_text("0.1.1", Some(UpdateStatus::Restarting)), "v0.1.1");
+    }
+
+    #[test]
     fn self_update_cleanup() {
         let exe = temp_exe("cleanup");
         fs::write(with_ext(&exe, ".old"), b"x").unwrap();
         fs::write(with_ext(&exe, ".new"), b"y").unwrap();
         let t = Instant::now();
-        cleanup(&exe);
+        assert!(cleanup(&exe)); // the previous version's leftover: just updated
         assert!(!with_ext(&exe, ".old").exists() && !with_ext(&exe, ".new").exists());
         assert!(exe.exists());
-        cleanup(&exe); // nothing to delete: returns at once
+        assert!(!cleanup(&exe)); // nothing to delete: returns at once
         assert!(t.elapsed() < Duration::from_secs(1));
         let _ = fs::remove_dir_all(exe.parent().unwrap());
     }

@@ -37,5 +37,5 @@ Each module is `src/<folder>/<file>.rs`, with its tests in a `#[cfg(test)] mod t
 - **Threads:** a stop flag is `stop: &AtomicBool`; long-lived threads are `util::thread::StopThread`. State shared across threads lives behind `Arc`; callbacks are `Box<dyn Fn(..) + Send + Sync>`.
 - **Time:** `std::time::{Duration, Instant}`.
 - **Tests:** `crate::testing::FakeMemory` is the byte-map `Memory`; inject `HttpGet` so tests never hit the network; each test uses its own temp dir (tests run in parallel).
-- **Self-update:** `app::self_update::update_on_startup(owner, repo, CARGO_PKG_VERSION)` runs first in main (before the single-instance mutex); it swaps in a newer, SHA-256-verified GitHub release exe and starts it, and on `true` the app exits at once. Failures go to `update.log`.
+- **Self-update:** `app::self_update::update_on_startup(owner, repo, CARGO_PKG_VERSION)` runs first in main (before the single-instance mutex); it swaps in a newer, SHA-256-verified GitHub release exe and starts it; on `UpdateStatus::Restarting` the app exits at once, otherwise `badge_text` turns the result into the dashboard badge. Failures go to `update.log`.
 - No new dependencies without a reason, no abstractions without two callers, no dead code.

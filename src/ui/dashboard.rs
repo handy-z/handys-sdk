@@ -34,7 +34,8 @@ use windows::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDIS_FOCUS, CDIS_HOT, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, CheckDlgButton,
     DRAWITEMSTRUCT, EM_SETLIMITTEXT, HTREEITEM, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
     IsDlgButtonChecked, LoadIconWithScaleDown, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMTVITEMCHANGE, SetWindowTheme,
-    TREE_VIEW_ITEM_STATE_FLAGS, TVE_EXPAND, TVI_FIRST, TVI_ROOT, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW,
+    TOOLTIPS_CLASSW, TREE_VIEW_ITEM_STATE_FLAGS, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTM_UPDATETIPTEXTW,
+    TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVE_EXPAND, TVI_FIRST, TVI_ROOT, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW,
     TVINSERTSTRUCTW_0, TVIS_STATEIMAGEMASK, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SETBKCOLOR,
     TVM_SETEXTENDEDSTYLE, TVM_SETITEMW, TVM_SETTEXTCOLOR, TVN_ITEMCHANGINGW, TVS_CHECKBOXES, TVS_EX_DOUBLEBUFFER,
     TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW, WM_MOUSELEAVE,
@@ -63,7 +64,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
     WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
-use windows::core::{BOOL, HSTRING, PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, IDC_HAND, SetCursor, WM_SETCURSOR, WS_EX_TOPMOST, WS_POPUP,
+};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 use super::Tone;
 use super::d2d::{Align, Canvas, Vector2, dwrite_factory, icon_image, load_image, rect_f, text_format};
@@ -220,7 +224,8 @@ pub(crate) const APP_ICON_ID: u16 = 1;
 
 pub struct Spec {
     pub title: String,
-    /// Drawn as a small pill right after the title (e.g. the app's version); empty: none.
+    /// Drawn as a small pill right after the title (e.g. the app's version); empty: none. `Dashboard::set_badge`
+    /// changes it.
     pub badge: String,
     pub window_class: String,
     pub rows: Vec<Row>,
@@ -285,6 +290,9 @@ const CAPTION_DIP: i32 = 32;
 const CAPTION_BUTTON_DIP: i32 = 46;
 const MINIMIZE: i32 = 0;
 const CLOSE: i32 = 1;
+const BADGE: i32 = 2; // the badge is clicked like a caption button
+const BADGE_PAD_DIP: i32 = 7;
+const BADGE_DOT_DIP: i32 = 6;
 
 /// A game's main window, built from a row table: its own title bar (icon, title, minimize and close), a status
 /// header, page tabs, then cards. Follows the system light/dark mode and accent color live, sizes itself to its
@@ -298,6 +306,7 @@ pub struct Dashboard<'a> {
     on_number: Slot<dyn Fn(&Dashboard<'a>, i32, i32) + 'a>,
     on_text: Slot<dyn Fn(&Dashboard<'a>, i32, &str) + 'a>,
     on_tree_check: Slot<dyn Fn(&Dashboard<'a>, i32, usize, bool) + 'a>,
+    on_badge_click: Slot<dyn Fn(&Dashboard<'a>) + 'a>,
     on_close: Slot<dyn Fn(&Dashboard<'a>) -> bool + 'a>,
     on_end_session: Slot<dyn Fn() + 'a>,
 
@@ -309,6 +318,9 @@ pub struct Dashboard<'a> {
     active: Cell<bool>,    // the title dims while another window is in front
     cap_hot: Cell<i32>,    // caption button under the mouse / pressed; -1 = none
     cap_down: Cell<i32>,
+    badge: RefCell<(String, Tone, String)>, // text, dot, hover tip
+    tooltip: Cell<HWND>,
+    tip_rect: Cell<RECT>, // the badge rect the tooltip's tool has
     // Drawing: Direct2D and DirectWrite on the canvas; the Win32 controls (labels, fields, trees) draw themselves with
     // the HFONTs. GDI is the fallback when Direct2D can't start.
     canvas: RefCell<Canvas>,
@@ -340,6 +352,16 @@ pub struct Dashboard<'a> {
     setting_tree: Cell<bool>,  // lets set_tree's own check changes through TVN_ITEMCHANGING
     trees: RefCell<HashMap<i32, TreeState>>,
     _pin: PhantomPinned, // the window keeps a pointer to it
+}
+
+/// The dot colour for `tone` (status header and badge).
+fn tone_color(theme: &Theme, tone: Tone) -> COLORREF {
+    match tone {
+        Tone::Good => theme.good,
+        Tone::Busy => theme.busy,
+        Tone::Bad => theme.bad,
+        Tone::Neutral => theme.text2,
+    }
 }
 
 fn loword(v: usize) -> u32 {
@@ -393,6 +415,7 @@ fn set_item_state(tv: HWND, h: HTREEITEM, state: u32, mask: u32) {
 
 impl<'a> Dashboard<'a> {
     pub fn new(spec: Spec) -> Pin<Box<Self>> {
+        let badge = RefCell::new((spec.badge.clone(), Tone::Neutral, String::new()));
         Box::pin(Self {
             spec,
             on_tick: RefCell::new(None),
@@ -400,6 +423,7 @@ impl<'a> Dashboard<'a> {
             on_number: RefCell::new(None),
             on_text: RefCell::new(None),
             on_tree_check: RefCell::new(None),
+            on_badge_click: RefCell::new(None),
             on_close: RefCell::new(None),
             on_end_session: RefCell::new(None),
             hwnd: Cell::new(HWND::default()),
@@ -410,6 +434,9 @@ impl<'a> Dashboard<'a> {
             active: Cell::new(true),
             cap_hot: Cell::new(-1),
             cap_down: Cell::new(-1),
+            badge,
+            tooltip: Cell::new(HWND::default()),
+            tip_rect: Cell::new(RECT::default()),
             canvas: RefCell::new(Canvas::default()),
             icon_image: RefCell::new(None),
             fonts: RefCell::new(Fonts::default()),
@@ -467,6 +494,10 @@ impl<'a> Dashboard<'a> {
     /// false = stay open (the game calls close() later); unset = close.
     pub fn on_close(&self, f: impl Fn(&Dashboard<'a>) -> bool + 'a) {
         *self.on_close.borrow_mut() = Some(Rc::new(f));
+    }
+    /// The badge clicked (pressed and released on it); the badge shows a hand cursor once this is set.
+    pub fn on_badge_click(&self, f: impl Fn(&Dashboard<'a>) + 'a) {
+        *self.on_badge_click.borrow_mut() = Some(Rc::new(f));
     }
     /// Logoff/shutdown: may end the process without WM_DESTROY.
     pub fn on_end_session(&self, f: impl Fn() + 'a) {
@@ -752,6 +783,82 @@ impl<'a> Dashboard<'a> {
         self.trees.borrow_mut().insert(id, st);
     }
 
+    /// The title bar badge: `text` in the pill after a dot colored by `tone`, `tip` as its hover tooltip (empty text:
+    /// no badge). Repaints only on change.
+    pub fn set_badge(&self, text: &str, tone: Tone, tip: &str) {
+        {
+            let mut b = self.badge.borrow_mut();
+            if b.0 == text && b.1 == tone && b.2 == tip {
+                return;
+            }
+            *b = (text.into(), tone, tip.into());
+        }
+        self.invalidate_caption();
+        self.sync_tip(true);
+    }
+
+    /// Points the tooltip's tool at the badge's rect (and, with `text`, sets its tip) when they changed.
+    fn sync_tip(&self, text: bool) {
+        let tip = self.tooltip.get();
+        if tip.is_invalid() {
+            return;
+        }
+        let rect = self.badge_pill().unwrap_or_default();
+        let moved = rect != self.tip_rect.get();
+        if !moved && !text {
+            return;
+        }
+        self.tip_rect.set(rect);
+        let mut s = wide(&self.badge.borrow().2);
+        let ti = TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            hwnd: self.hwnd.get(),
+            uId: BADGE as usize,
+            rect,
+            lpszText: PWSTR(s.as_mut_ptr()),
+            ..Default::default()
+        };
+        if moved {
+            send(tip, TTM_NEWTOOLRECTW, 0, &raw const ti as isize);
+        }
+        if text {
+            send(tip, TTM_UPDATETIPTEXTW, 0, &raw const ti as isize);
+        }
+    }
+
+    fn create_tooltip(&self) {
+        let h = self.hwnd.get();
+        let Ok(tip) = (unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                PCWSTR::null(),
+                WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                Some(h),
+                None,
+                Some(self.inst.get()),
+                None,
+            )
+        }) else {
+            return;
+        };
+        let mut s = wide(&self.badge.borrow().2);
+        let ti = TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_SUBCLASS,
+            hwnd: h,
+            uId: BADGE as usize,
+            lpszText: PWSTR(s.as_mut_ptr()),
+            ..Default::default()
+        };
+        send(tip, TTM_ADDTOOLW, 0, &raw const ti as isize);
+        self.tooltip.set(tip);
+    }
+
     /// Header: colored dot + title, detail on up to two muted lines below. Repaints only on change.
     pub fn set_status(&self, tone: Tone, title: &str, detail: &str) {
         if tone == self.tone.get() && *self.status_title.borrow() == title && *self.status_detail.borrow() == detail {
@@ -899,12 +1006,29 @@ impl<'a> Dashboard<'a> {
         }
     }
 
-    // -1 = none
+    // MINIMIZE, CLOSE, BADGE or -1 = none
     fn caption_button_at(&self, p: POINT) -> i32 {
+        if let Some(pill) = self.badge_pill()
+            && unsafe { PtInRect(&pill, p) }.as_bool()
+        {
+            return BADGE;
+        }
         [MINIMIZE, CLOSE]
             .into_iter()
             .find(|&b| unsafe { PtInRect(&self.caption_button(b), p) }.as_bool())
             .unwrap_or(-1)
+    }
+
+    /// Where the title starts in the caption.
+    fn title_left(&self) -> i32 {
+        self.px(12) + self.px(16) + self.px(10)
+    }
+
+    /// The badge's pill in the client area, if one is shown.
+    fn badge_pill(&self) -> Option<RECT> {
+        let title = window_text(self.hwnd.get());
+        self.badge_rects(self.title_left(), self.px(CAPTION_DIP), &title)
+            .map(|(pill, _)| pill)
     }
 
     fn invalidate_caption(&self) {
@@ -948,10 +1072,21 @@ impl<'a> Dashboard<'a> {
         };
         canvas.text(&title, self.text_format(0).as_ref(), &r, ink, Align::Left, false);
         if let Some((pill, text)) = self.badge_rects(r.left as i32, cap, &title) {
-            let fill = blend(theme.text, theme.bg, 0.1);
+            let (badge, tone, _) = self.badge.borrow().clone();
+            let hot = self.cap_hot.get() == BADGE && self.on_badge_click.borrow().is_some();
+            let fill = blend(theme.text, theme.bg, if hot { 0.16 } else { 0.1 });
             canvas.round_rect(&rect_f(&pill), (pill.bottom - pill.top) as f32 / 2.0, fill, None);
+            let dot = self.px(BADGE_DOT_DIP) as f32;
+            canvas.ellipse(
+                Vector2::new(
+                    (pill.left + self.px(BADGE_PAD_DIP)) as f32 + dot / 2.0,
+                    (pill.top + pill.bottom) as f32 / 2.0,
+                ),
+                dot / 2.0,
+                tone_color(&theme, tone),
+            );
             canvas.text(
-                &self.spec.badge,
+                &badge,
                 self.text_format(0).as_ref(),
                 &rect_f(&text),
                 theme.text2,
@@ -1010,23 +1145,22 @@ impl<'a> Dashboard<'a> {
     /// The badge's pill and its text, after `title` drawn from `left` in a caption `cap` pixels tall; None when there
     /// is no badge or it would not fit before the minimize button.
     fn badge_rects(&self, left: i32, cap: i32, title: &str) -> Option<(RECT, RECT)> {
-        if self.spec.badge.is_empty() {
+        let badge = self.badge.borrow().0.clone();
+        if badge.is_empty() {
             return None;
         }
-        let (title_w, badge_w) = (
-            self.caption_text_width(title),
-            self.caption_text_width(&self.spec.badge),
-        );
-        let (pad, h) = (self.px(7), self.px(18));
+        let (title_w, badge_w) = (self.caption_text_width(title), self.caption_text_width(&badge));
+        let (pad, h) = (self.px(BADGE_PAD_DIP), self.px(18));
+        let dot = self.px(BADGE_DOT_DIP) + self.px(5); // the tone dot and its gap before the text
         let pill = RECT {
             left: left + title_w + self.px(8),
             top: (cap - h) / 2,
-            right: left + title_w + self.px(8) + badge_w + 2 * pad,
+            right: left + title_w + self.px(8) + dot + badge_w + 2 * pad,
             bottom: (cap - h) / 2 + h,
         };
         (pill.right <= self.caption_button(MINIMIZE).left - self.px(8)).then(|| {
             let text = RECT {
-                left: pill.left + pad,
+                left: pill.left + pad + dot,
                 right: pill.right,
                 ..pill
             };
@@ -1072,7 +1206,7 @@ impl<'a> Dashboard<'a> {
                 DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
             if let Some((_, mut b)) = self.badge_rects(t.left, cap, &window_text(self.hwnd.get())) {
-                let mut badge: Vec<u16> = self.spec.badge.encode_utf16().collect();
+                let mut badge: Vec<u16> = self.badge.borrow().0.encode_utf16().collect();
                 SetTextColor(dc, theme.text2);
                 DrawTextW(dc, &mut badge, &mut b, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
             }
@@ -1656,12 +1790,7 @@ impl<'a> Dashboard<'a> {
     fn draw_header(&self, di: &DRAWITEMSTRUCT) {
         let rc = di.rcItem;
         let theme = self.theme.get();
-        let dot = match self.tone.get() {
-            Tone::Good => theme.good,
-            Tone::Busy => theme.busy,
-            Tone::Bad => theme.bad,
-            Tone::Neutral => theme.text2,
-        };
+        let dot = tone_color(&theme, self.tone.get());
         let d = self.px(10);
         let left = rc.left + d + self.px(12);
         let big_line_h = self.big_line_h.get();
@@ -2014,6 +2143,7 @@ impl<'a> Dashboard<'a> {
                 let inst = unsafe { (*(lp.0 as *const CREATESTRUCTW)).hInstance };
                 self.build(inst);
                 self.load_icons();
+                self.create_tooltip();
                 unsafe { SetTimer(Some(h), 1, self.spec.tick_ms, None) };
                 LRESULT(0)
             }
@@ -2080,8 +2210,15 @@ impl<'a> Dashboard<'a> {
                     let _ = unsafe { ReleaseCapture() };
                     self.invalidate_caption();
                     if self.caption_button_at(point_of(lp)) == b {
-                        let cmd = if b == CLOSE { SC_CLOSE } else { SC_MINIMIZE };
-                        send(h, WM_SYSCOMMAND, cmd as usize, 0);
+                        if b == BADGE {
+                            let f = self.on_badge_click.borrow().clone();
+                            if let Some(f) = f {
+                                f(self);
+                            }
+                        } else {
+                            let cmd = if b == CLOSE { SC_CLOSE } else { SC_MINIMIZE };
+                            send(h, WM_SYSCOMMAND, cmd as usize, 0);
+                        }
                     }
                 }
                 LRESULT(0)
@@ -2175,7 +2312,19 @@ impl<'a> Dashboard<'a> {
             }
             // paint fills all it repaints (its GDI fallback too): erasing first would only paint it twice
             WM_ERASEBKGND => LRESULT(1),
+            WM_SETCURSOR if loword(lp.0 as usize) == HTCLIENT && self.on_badge_click.borrow().is_some() => {
+                let mut p = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut p) };
+                let _ = unsafe { ScreenToClient(h, &mut p) };
+                if self.caption_button_at(p) == BADGE {
+                    unsafe { SetCursor(LoadCursorW(None, IDC_HAND).ok()) };
+                    LRESULT(1)
+                } else {
+                    def()
+                }
+            }
             WM_PAINT => {
+                self.sync_tip(false); // the badge moves with the title, its text and the DPI
                 let mut ps = PAINTSTRUCT::default();
                 let dc = unsafe { BeginPaint(h, &mut ps) };
                 self.paint(dc, &ps.rcPaint);
@@ -2339,6 +2488,7 @@ mod tests {
         GetObjectW, RDW_UPDATENOW, UpdateWindow,
     };
     use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+    use windows::Win32::UI::Controls::TTM_GETTOOLCOUNT;
     use windows::Win32::UI::Controls::{
         TVE_COLLAPSE, TVGN_CHILD, TVGN_NEXT, TVGN_ROOT, TVIS_EXPANDED, TVM_GETCOUNT, TVM_GETITEMSTATE, TVM_GETITEMW,
         TVM_GETNEXTITEM,
@@ -2453,6 +2603,48 @@ mod tests {
         let plain = Dashboard::new(spec(vec![value(1, "Status")]));
         assert!(plain.create());
         assert!(plain.badge_rects(plain.px(38), cap, "t").is_none()); // no badge set
+
+        // set_badge: the pill grows with the text, and an empty text hides it
+        d.set_badge("v1.2.3 \u{b7} downloading 42%", Tone::Busy, "Downloading");
+        let (wider, _) = d.badge_rects(d.px(38), cap, "t").expect("fits");
+        assert!(wider.right > pill.right && wider.left == pill.left);
+        d.set_badge("", Tone::Neutral, "");
+        assert!(d.badge_pill().is_none());
+        plain.set_badge("v1", Tone::Good, "tip");
+        assert!(plain.badge_pill().is_some());
+    }
+
+    #[test]
+    fn dashboard_badge_is_clickable() {
+        let clicks = Cell::new(0);
+        let mut s = spec(vec![value(1, "Status")]);
+        s.badge = "v1.2.3 \u{b7} latest".into();
+        let d = Dashboard::new(s);
+        d.on_badge_click(|_| clicks.set(clicks.get() + 1));
+        assert!(d.create());
+        let h = d.hwnd();
+        let pill = d.badge_pill().expect("shown");
+        let hit = |x: i32, y: i32| {
+            let mut p = POINT { x, y };
+            let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(h, &mut p) };
+            send(h, WM_NCHITTEST, 0, make_lparam(p.x, p.y)).0
+        };
+        let (cx, cy) = ((pill.left + pill.right) / 2, (pill.top + pill.bottom) / 2);
+        assert_eq!(hit(cx, cy), HTCLIENT as isize); // ours to click, not a drag area
+        assert_eq!(hit(pill.right + d.px(10), cy), HTCAPTION as isize); // the rest of the bar still drags
+        assert_eq!(hit(pill.left - d.px(3), cy), HTCAPTION as isize);
+        let on = make_lparam(cx, cy);
+        send(h, WM_LBUTTONDOWN, 1, on);
+        send(h, WM_LBUTTONUP, 0, on);
+        assert_eq!(clicks.get(), 1);
+        // pressed on the badge, released elsewhere: nothing
+        send(h, WM_LBUTTONDOWN, 1, on);
+        send(h, WM_LBUTTONUP, 0, make_lparam(pill.right + d.px(10), cy));
+        assert_eq!(clicks.get(), 1);
+        // the tooltip has one tool, on the badge
+        assert_eq!(send(d.tooltip.get(), TTM_GETTOOLCOUNT, 0, 0).0, 1);
+        d.set_badge("v1.2.3 \u{b7} v1.2.4 ready", Tone::Busy, "Click to restart");
+        assert_eq!(d.tip_rect.get(), d.badge_pill().unwrap());
     }
 
     #[test]

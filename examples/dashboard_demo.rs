@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
+use handy_sdk::app::self_update::{UpdateState, badge};
 use handy_sdk::ui::Tone;
 use handy_sdk::ui::dashboard::{
     Dashboard, Span, Spec, TreeItem, check, note, number, page, rich_value, section, text, tree, value,
@@ -54,10 +55,7 @@ fn main() {
 
     let d = Dashboard::new(Spec {
         title: "handy's sdk demo".into(),
-        badge: handy_sdk::app::self_update::badge_text(
-            "1.2.3",
-            Some(handy_sdk::app::self_update::UpdateStatus::Latest),
-        ),
+        badge: "v1.2.3".into(),
         window_class: "handys-sdk-demo-dashboard".into(),
         rows: vec![
             page("Overview"),
@@ -116,6 +114,26 @@ fn main() {
             ],
         );
         pill.set(if on.get() { "Demo on" } else { "Demo off" }, on.get());
+        // the self-update badge's states, one per second (the 50 ms tick)
+        let states = [
+            UpdateState::Checking,
+            UpdateState::Downloading {
+                percent: (n / 2 % 100) as u8,
+            },
+            UpdateState::Ready {
+                version: "1.2.4".into(),
+            },
+            UpdateState::Latest,
+            UpdateState::Offline,
+            UpdateState::Failed {
+                reason: "checksum mismatch".into(),
+            },
+        ];
+        let b = badge("1.2.3", &states[(n / 20) as usize % states.len()]);
+        ui.set_badge(&b.text, b.tone, &b.tip);
+    });
+    d.on_badge_click(|_| {
+        handy_sdk::ui::open_url("https://github.com/handy-z/handys-sdk/releases");
     });
     d.on_check(|_, id, checked| {
         if id == ON {

@@ -53,7 +53,7 @@ impl SingleInstance {
         }
     }
 
-    pub(crate) fn is_running(mutex_name: &str) -> bool {
+    pub fn is_running(mutex_name: &str) -> bool {
         let name = wide(mutex_name);
         match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
             Ok(m) => {

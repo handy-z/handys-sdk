@@ -17,7 +17,6 @@ Standalone crate (empty `[workspace]`, own `Cargo.lock`). In the shared developm
 
 ## Safety (never skip)
 
-- Never send input to Roblox in a public match.
 - Never change input timing the apps rely on (hold lengths, gaps, sending only while Roblox is foreground) and never leave keys held after a crash, close or toggle-off.
 - Low-level hook callbacks stay O(1) and non-blocking (atomics only).
 - **Nothing game-specific in the SDK.**

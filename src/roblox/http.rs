@@ -22,7 +22,7 @@ impl Drop for Internet {
     }
 }
 
-const CAP: usize = 1024 * 1024 + 1;
+const CAP: usize = 1024 * 1024;
 
 /// `https://host[:port]/path`; None for anything else.
 fn split_url(url: &str) -> Option<(&str, u16, &str)> {
@@ -35,8 +35,11 @@ fn split_url(url: &str) -> Option<(&str, u16, &str)> {
     (!host.is_empty()).then_some((host, port, if path.is_empty() { "/" } else { path }))
 }
 
-/// The response with `body` left empty, and the raw body (capped at 1 MB + 1 byte).
-fn fetch(url: &str, if_none_match: &str) -> (HttpResult, Vec<u8>) {
+/// The response with `body` left empty, and the raw body (capped at `cap` + 1 byte so callers can detect oversize).
+/// `headers` are extra request headers separated by CRLF; `timeout_ms` applies to each of resolve, connect, send and
+/// receive. Redirects are followed (WinHTTP's default policy, which only refuses HTTPS to HTTP).
+fn fetch(url: &str, headers: &str, cap: usize, timeout_ms: i32) -> (HttpResult, Vec<u8>) {
+    let limit = cap + 1;
     let mut res = HttpResult::default();
     let mut body = Vec::new();
     let Some((host, port, path)) = split_url(url) else {
@@ -54,7 +57,7 @@ fn fetch(url: &str, if_none_match: &str) -> (HttpResult, Vec<u8>) {
         if ses.0.is_null() {
             return (res, Vec::new());
         }
-        let _ = WinHttpSetTimeouts(ses.0, 10000, 10000, 10000, 10000);
+        let _ = WinHttpSetTimeouts(ses.0, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
         let con = Internet(WinHttpConnect(ses.0, PCWSTR(host.as_ptr()), port, 0));
         if con.0.is_null() {
             return (res, Vec::new());
@@ -71,8 +74,8 @@ fn fetch(url: &str, if_none_match: &str) -> (HttpResult, Vec<u8>) {
         if req.0.is_null() {
             return (res, Vec::new());
         }
-        if !if_none_match.is_empty() {
-            let h: Vec<u16> = format!("If-None-Match: {if_none_match}").encode_utf16().collect();
+        if !headers.is_empty() {
+            let h: Vec<u16> = headers.encode_utf16().collect();
             let _ = WinHttpAddRequestHeaders(req.0, &h, WINHTTP_ADDREQ_FLAG_ADD);
         }
         if WinHttpSendRequest(req.0, None, None, 0, 0, 0).is_err()
@@ -106,7 +109,7 @@ fn fetch(url: &str, if_none_match: &str) -> (HttpResult, Vec<u8>) {
         }
 
         let mut buf = [0u8; 8192];
-        while body.len() < CAP {
+        while body.len() < limit {
             let mut got = 0u32;
             if WinHttpReadData(req.0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got).is_err() {
                 return (res, Vec::new()); // cut off mid-body: status 0, so a partial file is never kept
@@ -114,7 +117,7 @@ fn fetch(url: &str, if_none_match: &str) -> (HttpResult, Vec<u8>) {
             if got == 0 {
                 break;
             }
-            body.extend_from_slice(&buf[..(got as usize).min(CAP - body.len())]);
+            body.extend_from_slice(&buf[..(got as usize).min(limit - body.len())]);
         }
         res.status = status as i32;
     }
@@ -124,14 +127,25 @@ fn fetch(url: &str, if_none_match: &str) -> (HttpResult, Vec<u8>) {
 /// HTTPS only; body capped at 1 MB + 1 byte so callers can detect oversize. Status 0 on any failure, including a
 /// connection lost mid-body.
 pub fn win_http_get(url: &str, if_none_match: &str) -> HttpResult {
-    let (mut res, body) = fetch(url, if_none_match);
+    let h = if if_none_match.is_empty() {
+        String::new()
+    } else {
+        format!("If-None-Match: {if_none_match}")
+    };
+    let (mut res, body) = fetch(url, &h, CAP, 10000);
     res.body = String::from_utf8_lossy_owned(body);
     res
 }
 
 /// `win_http_get` with the body kept as bytes, for downloads that are not text: (status, body).
 pub fn win_http_get_bytes(url: &str) -> (i32, Vec<u8>) {
-    let (res, body) = fetch(url, "");
+    let (res, body) = fetch(url, "", CAP, 10000);
+    (res.status, body)
+}
+
+/// `win_http_get_bytes` with extra headers, a body cap of `cap` + 1 byte and per-step timeouts: (status, body).
+pub(crate) fn win_http_get_capped(url: &str, headers: &str, cap: usize, timeout_ms: i32) -> (i32, Vec<u8>) {
+    let (res, body) = fetch(url, headers, cap, timeout_ms);
     (res.status, body)
 }
 

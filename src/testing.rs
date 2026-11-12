@@ -80,14 +80,17 @@ impl FakeMemory {
     /// MSVC std::string: 16-byte buffer or heap pointer, size@16, cap@24.
     pub fn str(&mut self, s: &str) -> usize {
         let a = self.alloc(32);
-        let (size, cap) = (s.len() as u64, if s.len() <= 15 { 15u64 } else { 31 });
+        let (size, cap) = (
+            s.len() as u64,
+            if s.len() <= 15 { 15u64 } else { s.len().max(31) as u64 },
+        );
         self.put(a, &[0; 16]); // the whole buffer is mapped, as in a real string
         let mut z = s.as_bytes().to_vec();
         z.push(0);
         if cap == 15 {
             self.put(a, &z);
         } else {
-            let h = self.alloc(64);
+            let h = self.alloc(s.len().max(63) + 1);
             self.put(h, &z);
             self.put_ptr(a, h);
         }

@@ -70,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 use super::Tone;
-use super::d2d::{Align, Canvas, Vector2, dwrite_factory, icon_image, load_image, rect_f, text_format};
+use super::d2d::{Align, Canvas, Vector2, dwrite_factory, icon_image, load_image, pixels_image, rect_f, text_format};
 use super::theme::{Theme, blend, gradient_at, readable_on, readable_on_outlined, rgb, system_theme};
 use crate::util::text::{from_wide, parse_bounded, wide};
 
@@ -649,12 +649,38 @@ impl<'a> Dashboard<'a> {
             }
         }
         let image = load_image(file, tint); // decoded into memory: the file isn't kept open
+        self.show_picture(id, file.to_path_buf(), tint, image)
+    }
+
+    /// A Value row's picture slot size in physical pixels (for rendering into it), None for no slot / not laid out yet.
+    pub fn picture_size(&self, id: i32) -> Option<(u32, u32)> {
+        let i = self
+            .spec
+            .rows
+            .iter()
+            .position(|r| r.id == id && r.kind == Kind::Value)?;
+        let s = *self.slots.borrow().get(i)?;
+        (!is_empty(&s)).then(|| ((s.right - s.left) as u32, (s.bottom - s.top) as u32))
+    }
+
+    /// Shows premultiplied BGRA pixels (w x h, as raster::render makes them) as that row's picture, replacing any image;
+    /// repaints the slot. A later set_picture always replaces it again (even with the same file/tint as before the pixels).
+    pub fn set_picture_pixels(&self, id: i32, w: u32, h: u32, bgra: &[u8]) {
+        // "<pixels>" can't be a Windows file name, so no set_picture path is ever taken for "unchanged"
+        self.show_picture(id, PathBuf::from("<pixels>"), None, pixels_image(w, h, bgra));
+    }
+
+    fn show_picture(&self, id: i32, file: PathBuf, tint: Option<u32>, image: Option<IWICBitmapSource>) -> bool {
         let shown = image.is_some();
-        self.pictures.borrow_mut().insert(id, (file.to_path_buf(), tint, image));
+        let old = self.pictures.borrow_mut().insert(id, (file, tint, image));
+        if let (Some((_, _, Some(old))), Ok(mut canvas)) = (old, self.canvas.try_borrow_mut()) {
+            canvas.forget(&old); // pixel pictures change every tick: don't let their bitmaps pile up
+        }
         let slots = self.slots.borrow().clone();
         for (r, s) in self.spec.rows.iter().zip(&slots) {
             if r.id == id && r.kind == Kind::Value {
-                let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), Some(s), true) };
+                // no erase: WM_ERASEBKGND does nothing and the paint fills the slot's background
+                let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), Some(s), false) };
             }
         }
         shown
@@ -2826,6 +2852,15 @@ mod tests {
         assert!(std::fs::remove_file(&bmp).is_ok()); // no lock left on it
         assert!(!d.set_picture(2, Path::new(""), None)); // cleared
         assert!(!d.set_picture(2, &bmp, None)); // gone now
+        let (w, h) = d.picture_size(2).unwrap();
+        assert!(w > 0 && h > 0);
+        assert_eq!(d.picture_size(1), None); // no slot
+        std::fs::write(&bmp, &b).unwrap(); // back, but the map still says (bmp, None): only the pixels can unstick it
+        d.set_picture_pixels(2, w, h, &vec![0xff; (w * h * 4) as usize]);
+        assert!(d.pictures.borrow()[&2].0 == Path::new("<pixels>"));
+        assert!(d.set_picture(2, &bmp, None)); // same file as before the pixels: read again, not "unchanged"
+        assert!(d.pictures.borrow()[&2].0 == bmp);
+        let _ = std::fs::remove_file(&bmp);
     }
 
     #[test]

@@ -210,6 +210,18 @@ pub(crate) fn load_image(file: &Path, tint: Option<u32>) -> Option<IWICBitmapSou
     }
 }
 
+/// Premultiplied BGRA pixels (w x h, 4*w bytes per row) copied into a WIC bitmap. None for no pixels or a short buffer.
+pub(crate) fn pixels_image(w: u32, h: u32, bgra: &[u8]) -> Option<IWICBitmapSource> {
+    let len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if len == 0 || bgra.len() < len {
+        return None;
+    }
+    let wic = wic_factory()?;
+    unsafe { wic.CreateBitmapFromMemory(w, h, &GUID_WICPixelFormat32bppPBGRA, w * 4, &bgra[..len]) }
+        .ok()
+        .map(Into::into)
+}
+
 pub(crate) fn icon_image(icon: HICON) -> Option<IWICBitmapSource> {
     let wic = wic_factory()?;
     if icon.is_invalid() {
@@ -591,6 +603,14 @@ impl Canvas {
                     DWRITE_MEASURING_MODE_NATURAL,
                 )
             };
+        }
+    }
+
+    /// Drops the bitmaps made from `source`, for a picture replaced every frame that would otherwise pile up.
+    pub fn forget(&mut self, source: &IWICBitmapSource) {
+        let key = source.as_raw() as usize;
+        for t in self.targets.values_mut() {
+            t.bitmaps.remove(&key);
         }
     }
 

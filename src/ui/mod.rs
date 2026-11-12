@@ -2,6 +2,7 @@ pub mod d2d;
 pub mod dashboard;
 pub mod gpu_overlay;
 pub mod overlay;
+pub mod raster;
 pub mod theme;
 
 /// Header dot colour: grey closed, amber on the way, green ready, red stuck.

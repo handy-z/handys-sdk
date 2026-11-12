@@ -220,6 +220,8 @@ pub(crate) const APP_ICON_ID: u16 = 1;
 
 pub struct Spec {
     pub title: String,
+    /// Drawn as a small pill right after the title (e.g. the app's version); empty: none.
+    pub badge: String,
     pub window_class: String,
     pub rows: Vec<Row>,
     /// Note id for Number hints.
@@ -234,6 +236,7 @@ impl Default for Spec {
     fn default() -> Self {
         Self {
             title: String::new(),
+            badge: String::new(),
             window_class: String::new(),
             rows: Vec::new(),
             hint_row: None,
@@ -944,6 +947,18 @@ impl<'a> Dashboard<'a> {
             bottom: cap as f32,
         };
         canvas.text(&title, self.text_format(0).as_ref(), &r, ink, Align::Left, false);
+        if let Some((pill, text)) = self.badge_rects(r.left as i32, cap, &title) {
+            let fill = blend(theme.text, theme.bg, 0.1);
+            canvas.round_rect(&rect_f(&pill), (pill.bottom - pill.top) as f32 / 2.0, fill, None);
+            canvas.text(
+                &self.spec.badge,
+                self.text_format(0).as_ref(),
+                &rect_f(&text),
+                theme.text2,
+                Align::Left,
+                false,
+            );
+        }
         for b in [MINIMIZE, CLOSE] {
             let r = self.caption_button(b);
             let (hot_b, down_b) = (self.cap_hot.get(), self.cap_down.get());
@@ -992,6 +1007,47 @@ impl<'a> Dashboard<'a> {
         }
     }
 
+    /// The badge's pill and its text, after `title` drawn from `left` in a caption `cap` pixels tall; None when there
+    /// is no badge or it would not fit before the minimize button.
+    fn badge_rects(&self, left: i32, cap: i32, title: &str) -> Option<(RECT, RECT)> {
+        if self.spec.badge.is_empty() {
+            return None;
+        }
+        let (title_w, badge_w) = (
+            self.caption_text_width(title),
+            self.caption_text_width(&self.spec.badge),
+        );
+        let (pad, h) = (self.px(7), self.px(18));
+        let pill = RECT {
+            left: left + title_w + self.px(8),
+            top: (cap - h) / 2,
+            right: left + title_w + self.px(8) + badge_w + 2 * pad,
+            bottom: (cap - h) / 2 + h,
+        };
+        (pill.right <= self.caption_button(MINIMIZE).left - self.px(8)).then(|| {
+            let text = RECT {
+                left: pill.left + pad,
+                right: pill.right,
+                ..pill
+            };
+            (pill, text)
+        })
+    }
+
+    /// Width in pixels of `s` in the caption font.
+    fn caption_text_width(&self, s: &str) -> i32 {
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        unsafe {
+            let dc = GetDC(Some(self.hwnd.get()));
+            let old = SelectObject(dc, self.fonts.borrow().faces[0].into());
+            let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+            SelectObject(dc, old);
+            ReleaseDC(Some(self.hwnd.get()), dc);
+        }
+        size.cx
+    }
+
     fn draw_caption_gdi(&self, dc: HDC) {
         let (cap, icon, x) = (self.px(CAPTION_DIP), self.px(16), self.px(12));
         let theme = self.theme.get();
@@ -1015,6 +1071,11 @@ impl<'a> Dashboard<'a> {
                 &mut t,
                 DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
+            if let Some((_, mut b)) = self.badge_rects(t.left, cap, &window_text(self.hwnd.get())) {
+                let mut badge: Vec<u16> = self.spec.badge.encode_utf16().collect();
+                SetTextColor(dc, theme.text2);
+                DrawTextW(dc, &mut badge, &mut b, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            }
             for b in [MINIMIZE, CLOSE] {
                 let mut r = self.caption_button(b);
                 let mut glyph: Vec<u16> = (if b == CLOSE { "\u{2715}" } else { "\u{2013}" })
@@ -2373,6 +2434,25 @@ mod tests {
         send(h, WM_LBUTTONDOWN, 1, close);
         send(h, WM_LBUTTONUP, 0, make_lparam(dip(80), dip(16)));
         assert_eq!(closes.get(), 1);
+    }
+
+    #[test]
+    fn dashboard_badge_sits_after_the_title() {
+        let mut s = spec(vec![value(1, "Status")]);
+        s.badge = "v1.2.3".into();
+        let d = Dashboard::new(s);
+        assert!(d.create());
+        let cap = d.px(CAPTION_DIP);
+        let (pill, text) = d.badge_rects(d.px(38), cap, "t").expect("fits");
+        assert!(pill.left > d.px(38) + d.caption_text_width("t")); // a gap after the title
+        assert!(pill.top > 0 && pill.bottom < cap); // inside the caption, centered
+        assert_eq!(pill.bottom - pill.top, d.px(18));
+        assert!(text.left > pill.left && text.right == pill.right);
+        assert!(pill.right < d.caption_button(MINIMIZE).left); // clear of the buttons
+        assert!(d.badge_rects(d.px(38), cap, &"x".repeat(500)).is_none()); // no room after a huge title: none
+        let plain = Dashboard::new(spec(vec![value(1, "Status")]));
+        assert!(plain.create());
+        assert!(plain.badge_rects(plain.px(38), cap, "t").is_none()); // no badge set
     }
 
     #[test]

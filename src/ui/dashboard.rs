@@ -2618,7 +2618,7 @@ mod tests {
     fn dashboard_badge_is_clickable() {
         let clicks = Cell::new(0);
         let mut s = spec(vec![value(1, "Status")]);
-        s.badge = "v1.2.3 \u{b7} latest".into();
+        s.badge = "v1.2.3 \u{b7} up-to-date".into();
         let d = Dashboard::new(s);
         d.on_badge_click(|_| clicks.set(clicks.get() + 1));
         assert!(d.create());

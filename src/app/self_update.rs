@@ -193,7 +193,7 @@ pub fn badge(current: &str, state: &UpdateState) -> Badge {
             "Checking GitHub for a newer version".into(),
         ),
         UpdateState::Latest => (
-            "latest".into(),
+            "up-to-date".into(),
             Tone::Good,
             "Up to date \u{b7} click for release notes".into(),
         ),
@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(
             b(Latest),
             (
-                t("v0.1.1 \u{b7} latest"),
+                t("v0.1.1 \u{b7} up-to-date"),
                 Tone::Good,
                 t("Up to date \u{b7} click for release notes")
             )

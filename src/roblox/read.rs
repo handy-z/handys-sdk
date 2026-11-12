@@ -366,6 +366,17 @@ impl VisibleProbe {
     }
 }
 
+/// GuiObject.Image (ImageLabel / ImageButton): "rbxassetid://123", empty when it shows nothing. The dumped offset is
+/// the image's Content; its URI string is 0x28 into it (read live on version-4ea8e85481e34f46).
+// shortcut: 0x28 is fixed; a Roblox update that moves it makes this read junk, so callers check the format.
+pub fn gui_image(m: &dyn Memory, o: &Offsets, gui: usize) -> Option<String> {
+    if gui == 0 {
+        None
+    } else {
+        read_string(m, o, o.at(gui, "GuiObject.Image") + 0x28)
+    }
+}
+
 /// GuiObject.Text
 pub fn gui_text(m: &dyn Memory, o: &Offsets, gui: usize) -> Option<String> {
     if gui == 0 {

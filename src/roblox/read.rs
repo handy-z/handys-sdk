@@ -291,13 +291,15 @@ pub(crate) fn find_visible_offset(shown: &[Vec<u8>], hidden: &[Vec<u8>], others:
 /// `GuiObject.Visible` from the offsets dump was wrong on some Roblox builds (e.g. version-4ea8e85481e34f46: 1837,
 /// really 837, read first as 1 on every object, later as 0, 2 or 127). An app that knows GUI objects that are
 /// normally shown and ones that are normally hidden calls `calibrate` with them each sample, plus any other GUI
-/// objects (`others`) as a sanity check; when the dumped offset disagrees with them it searches for the offset that
-/// agrees, and `read` uses that from then on. Until one is found `read` uses the dumped offset. When an anchor is
-/// legitimately in the other state no offset fits and nothing changes.
+/// objects (`others`) as a sanity check; when the offset in use disagrees with them it searches for the offset that
+/// agrees, and `read` uses that from then on. Until one is found `read` uses the dumped offset. The offset in use is
+/// checked again twice a second, because one found while the game was loading can be wrong (seen live: the catch XP
+/// popup read as hidden until the app restarted). When an anchor is legitimately in the other state no offset fits
+/// and nothing changes.
 #[derive(Default)]
 pub struct VisibleProbe {
     off: Option<usize>,
-    last_scan: Option<Instant>,
+    last_check: Option<Instant>,
 }
 
 impl VisibleProbe {
@@ -330,23 +332,23 @@ impl VisibleProbe {
         hidden: &[usize],
         others: &[usize],
     ) -> bool {
-        if self.off.is_some() || shown.contains(&0) || hidden.contains(&0) {
+        if shown.contains(&0) || hidden.contains(&0) {
             return false;
         }
-        // checked and rescanned at most twice a second
+        // checked, and rescanned when wrong, at most twice a second
         if self
-            .last_scan
+            .last_check
             .is_some_and(|t| t.elapsed() <= Duration::from_millis(500))
         {
             return false;
         }
+        self.last_check = Some(Instant::now());
         let agrees = shown.iter().all(|&g| self.read(m, o, g) == Some(true))
             && hidden.iter().all(|&g| self.read(m, o, g) == Some(false))
             && self.plausible(m, o, others);
         if agrees {
             return false;
         }
-        self.last_scan = Some(Instant::now());
         let snap = |&g: &usize| {
             let mut b = vec![0u8; VISIBLE_WINDOW];
             m.read(g, &mut b).then_some(b)
@@ -357,7 +359,8 @@ impl VisibleProbe {
             h.into_iter().collect::<Option<Vec<_>>>(),
         ) {
             let x: Vec<_> = others.iter().filter(|&&g| g != 0).filter_map(snap).collect();
-            self.off = find_visible_offset(&s, &h, &x);
+            // a scan that finds nothing keeps the offset in use: an anchor may just be in its other state
+            self.off = find_visible_offset(&s, &h, &x).or(self.off);
         }
         true
     }
@@ -566,6 +569,31 @@ mod tests {
         let mut q = VisibleProbe::default();
         q.calibrate(&m, &o, &[c], &[a], &[]);
         assert_eq!(q.off, None);
+        p.last_check = None; // as if 500 ms passed
+        assert!(p.calibrate(&m, &o, &[c], &[a], &[])); // disagrees: rescans, finds nothing, keeps 0x70
+        assert_eq!(p.off, Some(0x70));
+    }
+
+    #[test]
+    fn visible_probe_drops_a_wrong_offset_it_found_earlier() {
+        let (mut m, o) = (FakeMemory::default(), offs());
+        let (a, b, c) = (
+            m.alloc(VISIBLE_WINDOW),
+            m.alloc(VISIBLE_WINDOW),
+            m.alloc(VISIBLE_WINDOW),
+        );
+        for g in [a, b, c] {
+            m.put(g, &[0; VISIBLE_WINDOW]);
+        }
+        m.put(a + 0x70, &[1]);
+        m.put(b + 0x70, &[1]);
+        let mut p = VisibleProbe {
+            off: Some(0x90), // found while the game was loading, wrong now
+            last_check: None,
+        };
+        assert!(p.calibrate(&m, &o, &[a, b], &[c], &[]));
+        assert_eq!(p.off, Some(0x70));
+        assert!(!p.calibrate(&m, &o, &[a, b], &[c], &[])); // checked again only after 500 ms
     }
 
     #[test]

@@ -54,7 +54,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ES_AUTOHSCROLL, ES_NUMBER, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GWL_EXSTYLE, GWL_STYLE,
     GWLP_USERDATA, GetClientRect, GetDlgItem, GetDlgItemTextW, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
     GetWindowTextW, HICON, HMENU, HTCAPTION, HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDI_APPLICATION, IsChild,
-    IsDialogMessageW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MSG, MoveWindow, NCCALCSIZE_PARAMS,
+    IsDialogMessageW, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MSG, MoveWindow, NCCALCSIZE_PARAMS,
     NONCLIENTMETRICSW, PostQuitMessage, RegisterClassExW, SC_CLOSE, SC_MINIMIZE, SHOW_WINDOW_CMD, SM_CXICON,
     SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetDlgItemInt,
     SetDlgItemTextW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
@@ -71,7 +71,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 use super::Tone;
-use super::d2d::{Align, Canvas, Vector2, dwrite_factory, icon_image, load_image, pixels_image, rect_f, text_format};
+use super::d2d::{Align, Canvas, Vector2, dwrite_factory, icon_image, load_image, rect_f, text_format};
 use super::theme::{Theme, blend, gradient_at, readable_on, readable_on_outlined, rgb, system_theme};
 use crate::util::text::{from_wide, parse_bounded, wide};
 
@@ -810,38 +810,6 @@ impl<'a> Dashboard<'a> {
         }
         let image = load_image(file, tint); // decoded into memory: the file isn't kept open
         self.show_picture(id, file.to_path_buf(), tint, image)
-    }
-
-    /// A Value row's picture slot (a picture tile's picture area) size in physical pixels (for rendering into it), None
-    /// for no slot / not laid out yet.
-    pub fn picture_size(&self, id: i32) -> Option<(u32, u32)> {
-        let i = self
-            .spec
-            .rows
-            .iter()
-            .position(|r| r.id == id && matches!(r.kind, Kind::Value | Kind::Tile))?;
-        let s = *self.slots.borrow().get(i)?;
-        (!is_empty(&s)).then(|| ((s.right - s.left) as u32, (s.bottom - s.top) as u32))
-    }
-
-    /// Whether a Value row's or picture tile's picture can be seen now: the window shown, not minimized, and the row on
-    /// the current page. Cheap enough to call every tick before rendering into it.
-    pub fn picture_visible(&self, id: i32) -> bool {
-        let h = self.hwnd.get();
-        let on_page = self
-            .spec
-            .rows
-            .iter()
-            .position(|r| r.id == id && matches!(r.kind, Kind::Value | Kind::Tile))
-            .is_some_and(|i| self.page_of.borrow().get(i) == Some(&self.page.get()));
-        on_page && unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() }
-    }
-
-    /// Shows premultiplied BGRA pixels (w x h, as raster::render makes them) as that row's picture, replacing any image;
-    /// repaints the slot. A later set_picture always replaces it again (even with the same file/tint as before the pixels).
-    pub fn set_picture_pixels(&self, id: i32, w: u32, h: u32, bgra: &[u8]) {
-        // "<pixels>" can't be a Windows file name, so no set_picture path is ever taken for "unchanged"
-        self.show_picture(id, PathBuf::from("<pixels>"), None, pixels_image(w, h, bgra));
     }
 
     fn show_picture(&self, id: i32, file: PathBuf, tint: Option<u32>, image: Option<IWICBitmapSource>) -> bool {
@@ -3111,8 +3079,8 @@ mod tests {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowRect, IsWindow, PM_NOREMOVE, PW_RENDERFULLCONTENT, PeekMessageW, SW_SHOWMINNOACTIVE,
-        SW_SHOWNOACTIVATE, WM_GETFONT, WM_QUIT,
+        FindWindowExW, GetWindowRect, IsWindow, PM_NOREMOVE, PW_RENDERFULLCONTENT, PeekMessageW, SW_SHOWNOACTIVATE,
+        WM_GETFONT, WM_QUIT,
     };
 
     fn spec(rows: Vec<Row>) -> Spec {
@@ -3441,34 +3409,6 @@ mod tests {
         assert!(std::fs::remove_file(&bmp).is_ok()); // no lock left on it
         assert!(!d.set_picture(2, Path::new(""), None)); // cleared
         assert!(!d.set_picture(2, &bmp, None)); // gone now
-        let (w, h) = d.picture_size(2).unwrap();
-        assert!(w > 0 && h > 0);
-        assert_eq!(d.picture_size(1), None); // no slot
-        std::fs::write(&bmp, &b).unwrap(); // back, but the map still says (bmp, None): only the pixels can unstick it
-        d.set_picture_pixels(2, w, h, &vec![0xff; (w * h * 4) as usize]);
-        assert!(d.pictures.borrow()[&2].0 == Path::new("<pixels>"));
-        assert!(d.set_picture(2, &bmp, None)); // same file as before the pixels: read again, not "unchanged"
-        assert!(d.pictures.borrow()[&2].0 == bmp);
-        let _ = std::fs::remove_file(&bmp);
-    }
-
-    #[test]
-    fn dashboard_picture_visible() {
-        let d = Dashboard::new(spec(vec![
-            page("Main"),
-            value(1, "Fish").picture(96),
-            page("Settings"),
-            value(2, "Other").picture(96),
-        ]));
-        assert!(d.create());
-        assert!(!d.picture_visible(1)); // the window isn't shown yet
-        let _ = unsafe { ShowWindow(d.hwnd(), SW_SHOWNA) };
-        assert!(d.picture_visible(1) && !d.picture_visible(2));
-        d.show_page(1);
-        assert!(!d.picture_visible(1) && d.picture_visible(2));
-        assert!(!d.picture_visible(3)); // no such row
-        let _ = unsafe { ShowWindow(d.hwnd(), SW_SHOWMINNOACTIVE) };
-        assert!(!d.picture_visible(2));
     }
 
     #[test]
@@ -3913,12 +3853,8 @@ mod tests {
         let (a, s) = (to_client(a), d.slots.borrow()[1]);
         assert!(s.left > a.left && s.right < a.right && s.top > a.top + d.line_h.get() && s.bottom < a.bottom);
         assert_eq!(s.bottom - s.top, d.px(90));
-        let (w, h) = d.picture_size(1).unwrap();
-        assert_eq!((w as i32, h as i32), (s.right - s.left, s.bottom - s.top));
-        assert_eq!(d.picture_size(3), None); // a plain tile has no picture
+        assert!(is_empty(&d.slots.borrow()[3])); // a plain tile has no picture
         let _ = unsafe { ShowWindow(d.hwnd(), SW_SHOWNA) };
-        assert!(d.picture_visible(1));
-        d.set_picture_pixels(1, w, h, &vec![0xff; (w * h * 4) as usize]);
         d.set_spans(
             1,
             &[Span::plain("Big Carp · Rare\n182.1 kg · 1/27\n≈ 1,106 C$ · +195 XP")],

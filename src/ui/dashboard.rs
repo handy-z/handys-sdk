@@ -104,6 +104,9 @@ pub enum Kind {
 /// Tile: a stat in its own box; consecutive tiles on a card sit two per line across it (a lone last one takes one
 /// column). The label is small and muted at the top; set_text / set_spans give the value: its first line big, the text
 /// after the first '\n' a small muted line under it (colored spans keep their colors). Text too long is cut with "…".
+/// A picture tile (`picture`, DIP tall) puts an image (set_picture) under the label, fitted and centered across the
+/// tile, then the text in the body face, one line per '\n', `lines` of them, each cut with "…". Tiles on one line of
+/// the grid take the taller one's height so they sit level.
 /// Labels wider than Spec.label_width widen the label column (up to LABEL_MAX_DIP) instead of being cut.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
@@ -132,12 +135,12 @@ impl Row {
             options: Vec::new(),
         }
     }
-    /// How many text lines tall (Value, Tree).
+    /// How many text lines tall (Value, Tree, picture Tile).
     pub fn lines(mut self, n: i32) -> Self {
         self.lines = n;
         self
     }
-    /// A Value's picture slot, DIP wide.
+    /// A Value's picture slot, DIP wide; a Tile's picture area, DIP tall.
     pub fn picture(mut self, dip: i32) -> Self {
         self.picture = dip;
         self
@@ -212,6 +215,26 @@ fn tile_lines(spans: &[Span]) -> (Vec<Span>, Vec<Span>) {
         }
     }
     (big, small)
+}
+
+/// Spans split at every '\n' into lines, each span keeping its style on both sides of a split.
+fn span_lines(spans: &[Span]) -> Vec<Vec<Span>> {
+    let mut lines = vec![Vec::new()];
+    for s in spans {
+        for (k, part) in s.text.split('\n').enumerate() {
+            if k > 0 {
+                lines.push(Vec::new());
+            }
+            if !part.is_empty() {
+                let line = lines.last_mut().expect("starts with one line");
+                line.push(Span {
+                    text: part.to_owned(),
+                    ..s.clone()
+                });
+            }
+        }
+    }
+    lines
 }
 
 /// Tile `k` of a run across a card `width` wide: its column's left offset and width (two columns `gap` apart).
@@ -467,6 +490,16 @@ fn point_of(lp: LPARAM) -> POINT {
 }
 fn is_empty(r: &RECT) -> bool {
     r.right == r.left
+}
+/// An image's drawn size fitted into `s` (keeping its aspect, never enlarged); None for no size.
+fn fitted(img: &IWICBitmapSource, s: &RECT) -> Option<(f32, f32)> {
+    let (mut iw, mut ih) = (0u32, 0u32);
+    if unsafe { img.GetSize(&mut iw, &mut ih) }.is_err() || iw == 0 || ih == 0 {
+        return None;
+    }
+    let (sw, sh) = ((s.right - s.left) as f32, (s.bottom - s.top) as f32);
+    let k = (sw / iw as f32).min(sh / ih as f32).min(1.0);
+    Some((iw as f32 * k, ih as f32 * k))
 }
 // Tree checkboxes: state image 1 = off, 2 = on.
 fn checked_state(state: u32) -> bool {
@@ -763,9 +796,9 @@ impl<'a> Dashboard<'a> {
         let _ = unsafe { SetDlgItemInt(self.hwnd.get(), id, value as u32, true) };
     }
 
-    /// A Value row's picture: an image file (PNG, JPEG, BMP...) fitted into its slot, recolored to `tint` (0xRRGGBB)
-    /// when given; empty clears it. Reads the file only when the path or tint changes, and keeps no lock on it. False
-    /// when nothing is shown (empty, missing, unreadable).
+    /// A Value row's or picture tile's picture: an image file (PNG, JPEG, BMP...) fitted into its slot, recolored to
+    /// `tint` (0xRRGGBB) when given; empty clears it. Reads the file only when the path or tint changes, and keeps no
+    /// lock on it. False when nothing is shown (empty, missing, unreadable).
     pub fn set_picture(&self, id: i32, file: &Path, tint: Option<u32>) -> bool {
         {
             let mut pictures = self.pictures.borrow_mut();
@@ -778,26 +811,27 @@ impl<'a> Dashboard<'a> {
         self.show_picture(id, file.to_path_buf(), tint, image)
     }
 
-    /// A Value row's picture slot size in physical pixels (for rendering into it), None for no slot / not laid out yet.
+    /// A Value row's picture slot (a picture tile's picture area) size in physical pixels (for rendering into it), None
+    /// for no slot / not laid out yet.
     pub fn picture_size(&self, id: i32) -> Option<(u32, u32)> {
         let i = self
             .spec
             .rows
             .iter()
-            .position(|r| r.id == id && r.kind == Kind::Value)?;
+            .position(|r| r.id == id && matches!(r.kind, Kind::Value | Kind::Tile))?;
         let s = *self.slots.borrow().get(i)?;
         (!is_empty(&s)).then(|| ((s.right - s.left) as u32, (s.bottom - s.top) as u32))
     }
 
-    /// Whether a Value row's picture can be seen now: the window shown, not minimized, and the row on the current page.
-    /// Cheap enough to call every tick before rendering into it.
+    /// Whether a Value row's or picture tile's picture can be seen now: the window shown, not minimized, and the row on
+    /// the current page. Cheap enough to call every tick before rendering into it.
     pub fn picture_visible(&self, id: i32) -> bool {
         let h = self.hwnd.get();
         let on_page = self
             .spec
             .rows
             .iter()
-            .position(|r| r.id == id && r.kind == Kind::Value)
+            .position(|r| r.id == id && matches!(r.kind, Kind::Value | Kind::Tile))
             .is_some_and(|i| self.page_of.borrow().get(i) == Some(&self.page.get()));
         on_page && unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() }
     }
@@ -820,6 +854,11 @@ impl<'a> Dashboard<'a> {
             if r.id == id && r.kind == Kind::Value {
                 // no erase: WM_ERASEBKGND does nothing and the paint fills the slot's background
                 let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), Some(s), false) };
+            } else if r.id == id
+                && r.kind == Kind::Tile
+                && let Ok(c) = unsafe { GetDlgItem(Some(self.hwnd.get()), id) }
+            {
+                let _ = unsafe { InvalidateRect(Some(c), None, false) }; // a tile draws its own picture
             }
         }
         shown
@@ -1721,9 +1760,8 @@ impl<'a> Dashboard<'a> {
                 *card_top = *y;
                 *y += pad_v;
             };
-            // label, big line and small line, inside the box's padding
-            let tile_h = px(16) + 2 * line_h + big_h;
             let mut tile_k = 0usize; // this row's place in the run of tiles it is in
+            let mut tile_h = 0; // the current line of tiles' height
             for (i, r) in self.spec.rows.iter().enumerate() {
                 let (label, ctl) = ctls[i];
                 let rh = row_h + (r.lines - 1) * line_h; // extra lines at text spacing, not full rows
@@ -1734,10 +1772,22 @@ impl<'a> Dashboard<'a> {
                     Kind::Tile => {
                         open_card(&mut y, &mut card_top);
                         if tile_k.is_multiple_of(2) {
-                            y += px(4) + tile_h + px(4); // a new line of tiles
+                            // a new line of tiles, as tall as its taller tile so the two sit level
+                            let next = self.spec.rows.get(i + 1).filter(|n| n.kind == Kind::Tile);
+                            tile_h = next.map_or(self.tile_height(r), |n| self.tile_height(r).max(self.tile_height(n)));
+                            y += px(4) + tile_h + px(4);
                         }
                         let (dx, tw) = tile_column(tile_k, label_w + value_w, px(8));
-                        let _ = MoveWindow(ctl, x + dx, y - px(4) - tile_h, tw, tile_h, false);
+                        let t = RECT {
+                            left: x + dx,
+                            top: y - px(4) - tile_h,
+                            right: x + dx + tw,
+                            bottom: y - px(4),
+                        };
+                        let _ = MoveWindow(ctl, t.left, t.top, tw, tile_h, false);
+                        if r.picture != 0 {
+                            slots[i] = self.tile_picture(&t, r.picture);
+                        }
                         tile_k += 1;
                     }
                     Kind::Page => {
@@ -2093,21 +2143,18 @@ impl<'a> Dashboard<'a> {
         let slots = self.slots.borrow().clone();
         let pictures = self.pictures.borrow();
         for (i, s) in slots.iter().enumerate() {
-            if is_empty(s) || page_of[i] != page {
+            // a tile draws its own picture: the parent's paint is clipped out under it
+            if is_empty(s) || page_of[i] != page || self.spec.rows[i].kind == Kind::Tile {
                 continue;
             }
             let Some((_, _, Some(img))) = pictures.get(&self.spec.rows[i].id) else {
                 continue;
             };
-            let (mut iw, mut ih) = (0u32, 0u32);
-            if unsafe { img.GetSize(&mut iw, &mut ih) }.is_err() || iw == 0 || ih == 0 {
+            let Some((w, h)) = fitted(img, s) else {
                 continue;
-            }
-            // fitted, never enlarged, right-aligned and centered vertically
-            let (sw, sh) = ((s.right - s.left) as f32, (s.bottom - s.top) as f32);
-            let k = (sw / iw as f32).min(sh / ih as f32).min(1.0);
-            let (w, h) = (iw as f32 * k, ih as f32 * k);
-            let top = s.top as f32 + (sh - h) / 2.0;
+            };
+            // right-aligned and centered vertically
+            let top = s.top as f32 + ((s.bottom - s.top) as f32 - h) / 2.0;
             canvas.image(
                 img,
                 &D2D_RECT_F {
@@ -2226,10 +2273,33 @@ impl<'a> Dashboard<'a> {
         }
     }
 
+    // A tile's height: its label, big line and small line (a picture tile: label, picture and `lines` body lines),
+    // inside the box's padding.
+    fn tile_height(&self, r: &Row) -> i32 {
+        let line_h = self.line_h.get();
+        if r.picture != 0 {
+            self.px(24) + (1 + r.lines) * line_h + self.px(r.picture)
+        } else {
+            self.px(16) + 2 * line_h + self.big_line_h.get()
+        }
+    }
+
+    // A picture tile's picture area in a tile at `rc`: under the label, the box's width inside its padding.
+    fn tile_picture(&self, rc: &RECT, dip: i32) -> RECT {
+        let top = rc.top + self.px(12) + self.line_h.get();
+        RECT {
+            left: rc.left + self.px(12),
+            top,
+            right: rc.right - self.px(12),
+            bottom: top + self.px(dip),
+        }
+    }
+
     // A rounded box a shade off the card, like a field: the label small and muted, the value's first line in the
-    // status header's big face, its second line small and muted where a span has no color of its own.
-    fn draw_tile(&self, di: &DRAWITEMSTRUCT, label: &str, spans: &[Span]) {
-        let rc = di.rcItem;
+    // status header's big face, its second line small and muted where a span has no color of its own. A picture tile:
+    // the picture under the label, then each line in the body face.
+    fn draw_tile(&self, di: &DRAWITEMSTRUCT, r: &Row, spans: &[Span]) {
+        let (rc, label) = (di.rcItem, r.text.as_str());
         let theme = self.theme.get();
         let (big, body) = {
             let f = self.fonts.borrow();
@@ -2264,6 +2334,27 @@ impl<'a> Dashboard<'a> {
             Align::Left,
             false,
         );
+        if r.picture != 0 {
+            let p = self.tile_picture(&rc, r.picture);
+            if let Some((_, _, Some(img))) = self.pictures.borrow().get(&r.id)
+                && let Some((w, h)) = fitted(img, &p)
+            {
+                let (cx, cy) = ((p.left + p.right) as f32 / 2.0, (p.top + p.bottom) as f32 / 2.0);
+                let to = D2D_RECT_F {
+                    left: cx - w / 2.0,
+                    top: cy - h / 2.0,
+                    right: cx + w / 2.0,
+                    bottom: cy + h / 2.0,
+                };
+                canvas.image(img, &to);
+            }
+            for (k, line) in span_lines(spans).iter().take(r.lines.max(0) as usize).enumerate() {
+                let t = p.bottom + self.px(4) + k as i32 * line_h;
+                self.span_layout(canvas, line, &body, &at(t, line_h), theme.field, true);
+            }
+            canvas.end();
+            return;
+        }
         let (first, mut second) = tile_lines(spans);
         for s in second.iter_mut().filter(|s| s.colors.is_empty()) {
             s.colors = vec![theme.text2];
@@ -2775,7 +2866,7 @@ impl<'a> Dashboard<'a> {
                     if r.rich && di.hwndItem == c.1 {
                         let spans = self.spans.borrow().get(&r.id).cloned().unwrap_or_default();
                         if r.kind == Kind::Tile {
-                            self.draw_tile(di, &r.text, &spans);
+                            self.draw_tile(di, r, &spans);
                         } else {
                             self.draw_spans(di, &spans);
                         }
@@ -3757,6 +3848,79 @@ mod tests {
         assert_eq!((big[1].colors.clone(), small[0].colors.clone()), (gold.clone(), gold)); // colors kept both sides
         let (big, small) = tile_lines(&[Span::plain("0:01:00")]);
         assert_eq!((texts(&big), small.len()), (vec!["0:01:00".into()], 0)); // no second line
+    }
+
+    #[test]
+    fn span_lines_split_at_every_newline() {
+        let gold = vec![rgb(255, 200, 0)];
+        let gold_span = Span {
+            text: "1/27\n≈ 9 C$".into(),
+            colors: gold.clone(),
+            ..Default::default()
+        };
+        let lines = span_lines(&[Span::plain("Carp\n182 kg · "), gold_span, Span::plain("\n")]);
+        let texts: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|l| l.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, [vec!["Carp"], vec!["182 kg · ", "1/27"], vec!["≈ 9 C$"], vec![]]);
+        assert!(lines[1][1].colors == gold && lines[2][0].colors == gold); // the style on both sides
+        assert_eq!(span_lines(&[]).len(), 1);
+    }
+
+    #[test]
+    fn dashboard_picture_tiles_sit_level() {
+        let d = Dashboard::new(spec(vec![
+            section("Fish"),
+            tile(1, "Last catch").picture(90).lines(3),
+            tile(2, "Rarest").picture(60).lines(2),
+            tile(3, "Plain"),
+        ]));
+        assert!(d.create());
+        let rect = |id| {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(item(d.hwnd(), id), &mut r) }.unwrap();
+            r
+        };
+        let (a, b, c) = (rect(1), rect(2), rect(3));
+        let tall = d.px(24) + 4 * d.line_h.get() + d.px(90); // label, picture, 3 lines, padding
+        assert_eq!((a.top, a.bottom - a.top), (b.top, tall));
+        assert_eq!(b.bottom - b.top, tall); // the shorter one takes the taller's height
+        let plain_h = d.px(16) + 2 * d.line_h.get() + d.big_line_h.get();
+        assert_eq!(c.bottom - c.top, plain_h); // the next line: a plain tile, as before
+        // the picture area sits inside its tile, under the label
+        let to_client = |r: RECT| {
+            let mut p = [
+                POINT { x: r.left, y: r.top },
+                POINT {
+                    x: r.right,
+                    y: r.bottom,
+                },
+            ];
+            for q in &mut p {
+                let _ = unsafe { ScreenToClient(d.hwnd(), q) };
+            }
+            RECT {
+                left: p[0].x,
+                top: p[0].y,
+                right: p[1].x,
+                bottom: p[1].y,
+            }
+        };
+        let (a, s) = (to_client(a), d.slots.borrow()[1]);
+        assert!(s.left > a.left && s.right < a.right && s.top > a.top + d.line_h.get() && s.bottom < a.bottom);
+        assert_eq!(s.bottom - s.top, d.px(90));
+        let (w, h) = d.picture_size(1).unwrap();
+        assert_eq!((w as i32, h as i32), (s.right - s.left, s.bottom - s.top));
+        assert_eq!(d.picture_size(3), None); // a plain tile has no picture
+        let _ = unsafe { ShowWindow(d.hwnd(), SW_SHOWNA) };
+        assert!(d.picture_visible(1));
+        d.set_picture_pixels(1, w, h, &vec![0xff; (w * h * 4) as usize]);
+        d.set_spans(
+            1,
+            &[Span::plain("Big Carp · Rare\n182.1 kg · 1/27\n≈ 1,106 C$ · +195 XP")],
+        );
+        let _ = unsafe { UpdateWindow(d.hwnd()) }; // paints the picture and the lines without failing
     }
 
     #[test]

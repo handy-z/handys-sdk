@@ -15,8 +15,8 @@ use windows::Win32::Graphics::Direct2D::{D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_NONE, DWRITE_WORD_WRAPPING_NO_WRAP,
-    IDWriteTextFormat,
+    DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_TRIMMING_GRANULARITY_NONE,
+    DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
@@ -86,6 +86,7 @@ pub enum Kind {
     Note,
     Tree,
     Choice,
+    Tile,
 }
 
 /// One dashboard row. Page: starts a page; with two or more, tabs under the header switch them (Ctrl+Tab too).
@@ -100,6 +101,9 @@ pub enum Kind {
 /// Note: full-width warning-colored text under the card (empty = blank).
 /// Tree: card-wide scrolling tree `lines` items tall with a checkbox per item; the game owns the checks (set_tree,
 /// on_tree_check). Items keep their expanded state across set_tree calls by key.
+/// Tile: a stat in its own box; consecutive tiles on a card sit two per line across it (a lone last one takes one
+/// column). The label is small and muted at the top; set_text / set_spans give the value: its first line big, the text
+/// after the first '\n' a small muted line under it (colored spans keep their colors). Text too long is cut with "…".
 /// Labels wider than Spec.label_width widen the label column (up to LABEL_MAX_DIP) instead of being cut.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
@@ -178,6 +182,45 @@ pub fn choice(id: i32, label: &str, options: &[&str]) -> Row {
     Row {
         options: options.iter().map(|&o| o.to_owned()).collect(),
         ..Row::new(Kind::Choice, id, label)
+    }
+}
+pub fn tile(id: i32, label: &str) -> Row {
+    Row {
+        rich: true, // set_text becomes one plain span, so both setters draw the same way
+        ..Row::new(Kind::Tile, id, label)
+    }
+}
+
+/// A tile's spans split at the first '\n' into its big line and its small one. Later '\n's become spaces: the small
+/// line is one line too.
+fn tile_lines(spans: &[Span]) -> (Vec<Span>, Vec<Span>) {
+    let (mut big, mut small) = (Vec::new(), Vec::new());
+    let mut split = false;
+    let with = |s: &Span, text: &str| Span {
+        text: text.replace('\n', " "),
+        ..s.clone()
+    };
+    for s in spans {
+        if split {
+            small.push(with(s, &s.text));
+        } else if let Some((a, b)) = s.text.split_once('\n') {
+            split = true;
+            big.push(with(s, a));
+            small.push(with(s, b));
+        } else {
+            big.push(s.clone());
+        }
+    }
+    (big, small)
+}
+
+/// Tile `k` of a run across a card `width` wide: its column's left offset and width (two columns `gap` apart).
+fn tile_column(k: usize, width: i32, gap: i32) -> (i32, i32) {
+    let w = (width - gap) / 2;
+    if k.is_multiple_of(2) {
+        (0, w)
+    } else {
+        (w + gap, width - w - gap)
     }
 }
 
@@ -792,9 +835,12 @@ impl<'a> Dashboard<'a> {
             }
             *shown = spans.to_vec();
         }
-        let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let mut plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+        if let Some(r) = self.spec.rows.iter().find(|r| r.id == id && r.kind == Kind::Tile) {
+            plain = format!("{}: {plain}", r.text); // a tile has no label control of its own to read
+        }
         let h = self.hwnd.get();
-        // what a screen reader reads; the spans are drawn (draw_spans)
+        // what a screen reader reads; the spans are drawn (draw_spans, draw_tile)
         let _ = unsafe { SetDlgItemTextW(h, id, &HSTRING::from(plain)) };
         if let Ok(c) = unsafe { GetDlgItem(Some(h), id) } {
             let _ = unsafe { InvalidateRect(Some(c), None, false) };
@@ -1675,10 +1721,25 @@ impl<'a> Dashboard<'a> {
                 *card_top = *y;
                 *y += pad_v;
             };
+            // label, big line and small line, inside the box's padding
+            let tile_h = px(16) + 2 * line_h + big_h;
+            let mut tile_k = 0usize; // this row's place in the run of tiles it is in
             for (i, r) in self.spec.rows.iter().enumerate() {
                 let (label, ctl) = ctls[i];
                 let rh = row_h + (r.lines - 1) * line_h; // extra lines at text spacing, not full rows
+                if r.kind != Kind::Tile {
+                    tile_k = 0;
+                }
                 match r.kind {
+                    Kind::Tile => {
+                        open_card(&mut y, &mut card_top);
+                        if tile_k.is_multiple_of(2) {
+                            y += px(4) + tile_h + px(4); // a new line of tiles
+                        }
+                        let (dx, tw) = tile_column(tile_k, label_w + value_w, px(8));
+                        let _ = MoveWindow(ctl, x + dx, y - px(4) - tile_h, tw, tile_h, false);
+                        tile_k += 1;
+                    }
                     Kind::Page => {
                         close_card(&mut y, &mut card_top, page, &mut cards);
                         bottoms[page as usize] = bottoms[page as usize].max(y);
@@ -1879,6 +1940,8 @@ impl<'a> Dashboard<'a> {
                         },
                     );
                 }
+                // the label is drawn in the box; until a value comes it is also the accessible name
+                Kind::Tile => ctl = child(stat, &r.text, SS_OWNERDRAW.0, r.id),
                 Kind::Check => {
                     // the game owns the state; drawn as a switch
                     ctl = child(button, &r.text, BS_CHECKBOX as u32 | WS_TABSTOP.0, r.id);
@@ -2133,53 +2196,134 @@ impl<'a> Dashboard<'a> {
         canvas.end();
     }
 
-    // Spans left to right, a new line at each '\n', cut at the control's right edge: one DirectWrite layout, each span
-    // its own face, each glyph its own color (a gradient span's change along it). An outlined span's outline is the
-    // text drawn a DIP off in all 8 directions under the fill, as the wiki draws the game's outlined text
-    // (text-shadow). Color glyphs (emoji) keep their own colors.
     fn draw_spans(&self, di: &DRAWITEMSTRUCT, spans: &[Span]) {
         let rc = di.rcItem;
         let theme = self.theme.get();
-        let all: Vec<u16> = spans.iter().flat_map(|s| s.text.encode_utf16()).collect();
         let body = self.text_format(0);
-        let layout = body.as_ref().zip(dwrite_factory()).and_then(|(f, dw)| unsafe {
-            dw.CreateTextLayout(&all, f, (rc.right - rc.left) as f32, (rc.bottom - rc.top) as f32)
-                .ok()
-        });
         let mut canvas = self.canvas.try_borrow_mut().ok();
-        let began = layout.is_some() && canvas.as_mut().is_some_and(|c| c.begin(di.hDC, &rc, None));
-        let (Some(layout), Some(canvas)) = (layout.filter(|_| began), canvas.as_mut().filter(|_| began)) else {
-            // no Direct2D: the plain text in the theme's color
-            let dc = di.hDC;
-            unsafe {
-                FillRect(dc, &rc, self.brushes.get()[1]);
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, theme.text);
-                let old = SelectObject(dc, self.fonts.borrow().faces[0].into());
-                let mut t = rc;
-                let mut s = all.clone();
-                DrawTextW(dc, &mut s, &mut t, DT_NOPREFIX | DT_NOCLIP);
-                SelectObject(dc, old);
-            }
+        let began = body.is_some() && canvas.as_mut().is_some_and(|c| c.begin(di.hDC, &rc, None));
+        let (Some(body), Some(canvas)) = (body.filter(|_| began), canvas.as_mut().filter(|_| began)) else {
+            let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+            return self.draw_plain_gdi(di, &plain);
+        };
+        canvas.fill(&rect_f(&rc), theme.card, 1.0);
+        self.span_layout(canvas, spans, &body, &rc, theme.card, false);
+        canvas.end();
+    }
+
+    // No Direct2D: the plain text in the theme's color on the card.
+    fn draw_plain_gdi(&self, di: &DRAWITEMSTRUCT, text: &str) {
+        let dc = di.hDC;
+        unsafe {
+            FillRect(dc, &di.rcItem, self.brushes.get()[1]);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, self.theme.get().text);
+            let old = SelectObject(dc, self.fonts.borrow().faces[0].into());
+            let mut t = di.rcItem;
+            let mut s: Vec<u16> = text.encode_utf16().collect();
+            DrawTextW(dc, &mut s, &mut t, DT_NOPREFIX | DT_NOCLIP);
+            SelectObject(dc, old);
+        }
+    }
+
+    // A rounded box a shade off the card, like a field: the label small and muted, the value's first line in the
+    // status header's big face, its second line small and muted where a span has no color of its own.
+    fn draw_tile(&self, di: &DRAWITEMSTRUCT, label: &str, spans: &[Span]) {
+        let rc = di.rcItem;
+        let theme = self.theme.get();
+        let (big, body) = {
+            let f = self.fonts.borrow();
+            (f.big_text.clone(), f.text[0].clone())
+        };
+        let mut canvas = self.canvas.try_borrow_mut().ok();
+        let began = big.is_some() && body.is_some() && canvas.as_mut().is_some_and(|c| c.begin(di.hDC, &rc, None));
+        let (Some(big), Some(body), Some(canvas)) = (
+            big.filter(|_| began),
+            body.filter(|_| began),
+            canvas.as_mut().filter(|_| began),
+        ) else {
+            let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+            return self.draw_plain_gdi(di, &format!("{label}\n{plain}"));
+        };
+        canvas.fill(&rect_f(&rc), theme.card, 1.0); // the corners outside the box
+        canvas.round_rect(&rect_f(&rc), self.px(6) as f32, theme.field, Some(theme.stroke));
+        let (line_h, big_h) = (self.line_h.get(), self.big_line_h.get());
+        let (left, right) = (rc.left + self.px(12), rc.right - self.px(12));
+        let at = |top: i32, h: i32| RECT {
+            left,
+            top,
+            right,
+            bottom: top + h,
+        };
+        let top = rc.top + self.px(8);
+        canvas.text(
+            label,
+            Some(&body),
+            &rect_f(&at(top, line_h)),
+            theme.text2,
+            Align::Left,
+            false,
+        );
+        let (first, mut second) = tile_lines(spans);
+        for s in second.iter_mut().filter(|s| s.colors.is_empty()) {
+            s.colors = vec![theme.text2];
+        }
+        self.span_layout(canvas, &first, &big, &at(top + line_h, big_h), theme.field, true);
+        self.span_layout(
+            canvas,
+            &second,
+            &body,
+            &at(top + line_h + big_h, line_h),
+            theme.field,
+            true,
+        );
+        canvas.end();
+    }
+
+    // Spans left to right on `bg`, a new line at each '\n', cut at r's right edge (one_line: one line, cut with "…"):
+    // one DirectWrite layout, each span its own face, each glyph its own color (a gradient span's change along it). An
+    // outlined span's outline is the text drawn a DIP off in all 8 directions under the fill, as the wiki draws the
+    // game's outlined text (text-shadow). Color glyphs (emoji) keep their own colors.
+    fn span_layout(
+        &self,
+        canvas: &mut Canvas,
+        spans: &[Span],
+        format: &IDWriteTextFormat,
+        rc: &RECT,
+        bg: COLORREF,
+        one_line: bool,
+    ) {
+        let theme = self.theme.get();
+        let all: Vec<u16> = spans.iter().flat_map(|s| s.text.encode_utf16()).collect();
+        let (w, h) = ((rc.right - rc.left) as f32, (rc.bottom - rc.top) as f32);
+        let Some(layout) = dwrite_factory().and_then(|dw| unsafe { dw.CreateTextLayout(&all, format, w, h) }.ok())
+        else {
             return;
         };
+        let sign = if one_line { canvas.ellipsis(format) } else { None };
         unsafe {
             // the format is shared with single-line text: set everything this needs
             let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
             let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-            let none = DWRITE_TRIMMING {
-                granularity: DWRITE_TRIMMING_GRANULARITY_NONE,
+            let trim = DWRITE_TRIMMING {
+                granularity: if one_line {
+                    DWRITE_TRIMMING_GRANULARITY_CHARACTER
+                } else {
+                    DWRITE_TRIMMING_GRANULARITY_NONE
+                },
                 delimiter: 0,
                 delimiterCount: 0,
             };
-            let _ = layout.SetTrimming(&none, None);
-            // lines as far apart as the controls' (GDI) lines: the rows were laid out for them
-            let _ = layout.SetLineSpacing(
-                DWRITE_LINE_SPACING_METHOD_UNIFORM,
-                self.line_h.get() as f32,
-                self.ascent.get() as f32,
-            );
+            let _ = layout.SetTrimming(&trim, sign.as_ref());
+            if !one_line {
+                // lines as far apart as the controls' (GDI) lines: the rows were laid out for them
+                let _ = layout.SetLineSpacing(
+                    DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                    self.line_h.get() as f32,
+                    self.ascent.get() as f32,
+                );
+            }
         }
         let len = |s: &Span| s.text.encode_utf16().count() as u32;
         let mut pos = 0u32;
@@ -2191,11 +2335,7 @@ impl<'a> Dashboard<'a> {
             };
             let o = s.stroke_opacity > 0.0;
             outlined |= o;
-            let edge = if o {
-                blend(s.stroke, theme.card, s.stroke_opacity)
-            } else {
-                theme.card
-            };
+            let edge = if o { blend(s.stroke, bg, s.stroke_opacity) } else { bg };
             unsafe {
                 let _ = layout.SetFontWeight(
                     if s.bold {
@@ -2219,10 +2359,9 @@ impl<'a> Dashboard<'a> {
             }
             pos += range.length;
         }
-        canvas.fill(&rect_f(&rc), theme.card, 1.0);
         let rt = canvas.rt().clone();
         let (x, y, off) = (rc.left as f32, rc.top as f32, self.px(1) as f32);
-        if outlined && let Some(clear) = canvas.brush(theme.card, 0.0) {
+        if outlined && let Some(clear) = canvas.brush(bg, 0.0) {
             // outlines first; the other spans are drawn see-through in this pass
             for dx in -1..=1 {
                 for dy in -1..=1 {
@@ -2235,12 +2374,12 @@ impl<'a> Dashboard<'a> {
         }
         pos = 0;
         for s in spans {
-            let edge = blend(s.stroke, theme.card, s.stroke_opacity);
+            let edge = blend(s.stroke, bg, s.stroke_opacity);
             let mut ink = |c: COLORREF| {
                 let c = if s.stroke_opacity > 0.0 {
-                    readable_on_outlined(c, theme.card, edge)
+                    readable_on_outlined(c, bg, edge)
                 } else {
-                    readable_on(c, theme.card)
+                    readable_on(c, bg)
                 };
                 canvas.brush(c, 1.0)
             };
@@ -2288,7 +2427,6 @@ impl<'a> Dashboard<'a> {
                 )
             };
         }
-        canvas.end();
     }
 
     // Page tabs, toggle switches, choices and number steps stay real buttons (focus, Space, screen readers); only
@@ -2636,7 +2774,11 @@ impl<'a> Dashboard<'a> {
                 for (r, c) in self.spec.rows.iter().zip(&ctls) {
                     if r.rich && di.hwndItem == c.1 {
                         let spans = self.spans.borrow().get(&r.id).cloned().unwrap_or_default();
-                        self.draw_spans(di, &spans);
+                        if r.kind == Kind::Tile {
+                            self.draw_tile(di, &r.text, &spans);
+                        } else {
+                            self.draw_spans(di, &spans);
+                        }
                         return LRESULT(1);
                     }
                 }
@@ -3593,6 +3735,68 @@ mod tests {
         assert_eq!(segment_at(300, 3, 400), 2); // clamped
         assert_eq!(segment_at(300, 3, -5), 0);
         assert_eq!(segment_at(300, 0, 10), 0); // no options: no panic
+    }
+
+    #[test]
+    fn tile_lines_split_at_the_first_newline() {
+        let gold = vec![rgb(255, 200, 0)];
+        let s = |text: &str, colors: &[COLORREF]| Span {
+            text: text.into(),
+            colors: colors.to_vec(),
+            ..Default::default()
+        };
+        let texts = |v: &[Span]| v.iter().map(|s| s.text.clone()).collect::<Vec<_>>();
+        let (big, small) = tile_lines(&[Span::plain("12 caught\n294/h\nstreak 12")]);
+        assert_eq!(
+            (texts(&big), texts(&small)),
+            (vec!["12 caught".into()], vec!["294/h streak 12".into()])
+        );
+        let (big, small) = tile_lines(&[s("≈ ", &[]), s("59 C$\n1/h", &gold), s(" more", &[])]);
+        assert_eq!(texts(&big), ["≈ ", "59 C$"]);
+        assert_eq!(texts(&small), ["1/h", " more"]);
+        assert_eq!((big[1].colors.clone(), small[0].colors.clone()), (gold.clone(), gold)); // colors kept both sides
+        let (big, small) = tile_lines(&[Span::plain("0:01:00")]);
+        assert_eq!((texts(&big), small.len()), (vec!["0:01:00".into()], 0)); // no second line
+    }
+
+    #[test]
+    fn tile_column_splits_the_card_in_two() {
+        assert_eq!(tile_column(0, 101, 9), (0, 46));
+        assert_eq!(tile_column(1, 101, 9), (55, 46)); // ends at the card's edge
+        assert_eq!(tile_column(2, 101, 9), (0, 46)); // the next line, one column even when alone
+    }
+
+    #[test]
+    fn dashboard_tiles_sit_two_per_line() {
+        let d = Dashboard::new(spec(vec![
+            section("S"),
+            tile(1, "Catches"),
+            tile(2, "Earned"),
+            tile(3, "XP"),
+            section("T"),
+            tile(4, "A"),
+            value(5, "V"),
+            tile(6, "B"),
+        ]));
+        assert!(d.create());
+        let rect = |id| {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(item(d.hwnd(), id), &mut r) }.unwrap();
+            r
+        };
+        let (a, b, c) = (rect(1), rect(2), rect(3));
+        let tile_h = d.px(16) + 2 * d.line_h.get() + d.big_line_h.get();
+        assert_eq!((a.top, a.bottom - a.top), (b.top, tile_h)); // one line
+        assert_eq!(b.left, a.right + d.px(8));
+        assert_eq!((c.left, c.right, c.top), (a.left, a.right, a.bottom + d.px(8))); // the lone last: one column
+        let card = d.cards.borrow()[0].1;
+        assert_eq!(b.right - a.left, card.right - card.left - 2 * d.px(14)); // the card's width
+        assert_eq!(card.bottom - card.top, 2 * d.px(6) + 2 * (tile_h + d.px(8)));
+        assert_eq!(rect(6).left, rect(4).left); // a run ends at any other row
+        d.set_text(1, "12 caught\n294/h");
+        assert_eq!(text_of(d.hwnd(), 1), "Catches: 12 caught\n294/h"); // label and value, for screen readers
+        assert_eq!(text_of(d.hwnd(), 2), "Earned"); // no value yet: the label
+        let _ = unsafe { UpdateWindow(d.hwnd()) };
     }
 
     #[test]

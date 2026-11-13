@@ -545,6 +545,17 @@ impl Canvas {
         }
     }
 
+    /// The "…" that cut text in `format` ends with: one per format, made on its first use.
+    pub(crate) fn ellipsis(&mut self, format: &IDWriteTextFormat) -> Option<IDWriteInlineObject> {
+        let key = format.as_raw() as usize;
+        if !self.ellipses.contains_key(&key)
+            && let Some(sign) = dwrite_factory().and_then(|f| unsafe { f.CreateEllipsisTrimmingSign(format) }.ok())
+        {
+            self.ellipses.insert(key, (format.clone(), sign));
+        }
+        self.ellipses.get(&key).map(|e| e.1.clone())
+    }
+
     /// One line, vertically centered in r, cut with an ellipsis when too long; wrap: word-wrapped from r's top instead.
     pub fn text(
         &mut self,
@@ -578,19 +589,13 @@ impl Canvas {
                 DWRITE_WORD_WRAPPING_NO_WRAP
             });
         }
-        // one "â€¦" per format, made on its first use
-        let key = format.as_raw() as usize;
-        if !self.ellipses.contains_key(&key)
-            && let Some(sign) = dwrite_factory().and_then(|f| unsafe { f.CreateEllipsisTrimmingSign(format) }.ok())
-        {
-            self.ellipses.insert(key, (format.clone(), sign));
-        }
         let trim = DWRITE_TRIMMING {
             granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             delimiter: 0,
             delimiterCount: 0,
         };
-        let _ = unsafe { format.SetTrimming(&trim, self.ellipses.get(&key).map(|e| &e.1)) };
+        let sign = self.ellipsis(format);
+        let _ = unsafe { format.SetTrimming(&trim, sign.as_ref()) };
         let wide: Vec<u16> = s.encode_utf16().collect();
         if let Some(b) = self.brush(c, 1.0) {
             unsafe {

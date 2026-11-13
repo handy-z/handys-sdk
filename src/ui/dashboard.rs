@@ -34,18 +34,19 @@ use windows::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CDDS_PREPAINT, CDIS_FOCUS, CDIS_HOT, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, CheckDlgButton,
     DRAWITEMSTRUCT, EM_SETLIMITTEXT, HTREEITEM, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
     IsDlgButtonChecked, LoadIconWithScaleDown, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, NMTVITEMCHANGE, SetWindowTheme,
-    TOOLTIPS_CLASSW, TREE_VIEW_ITEM_STATE_FLAGS, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTM_UPDATETIPTEXTW,
-    TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVE_EXPAND, TVI_FIRST, TVI_ROOT, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVINSERTSTRUCTW_0, TVIS_STATEIMAGEMASK, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SETBKCOLOR,
-    TVM_SETEXTENDEDSTYLE, TVM_SETITEMW, TVM_SETTEXTCOLOR, TVN_ITEMCHANGINGW, TVS_CHECKBOXES, TVS_EX_DOUBLEBUFFER,
-    TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEWW, WM_MOUSELEAVE,
+    TOOLTIPS_CLASSW, TREE_VIEW_ITEM_STATE_FLAGS, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTM_SETMAXTIPWIDTH,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, TVE_EXPAND, TVI_FIRST, TVI_ROOT, TVIF_STATE,
+    TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_STATEIMAGEMASK, TVITEMW, TVM_DELETEITEM, TVM_EXPAND,
+    TVM_INSERTITEMW, TVM_SETBKCOLOR, TVM_SETEXTENDEDSTYLE, TVM_SETITEMW, TVM_SETTEXTCOLOR, TVN_ITEMCHANGINGW,
+    TVS_CHECKBOXES, TVS_EX_DOUBLEBUFFER, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    WC_TREEVIEWW, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB,
+    VK_CONTROL, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BN_CLICKED, BS_CHECKBOX, BS_PUSHBUTTON, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DI_NORMAL,
@@ -65,7 +66,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, IDC_HAND, SetCursor, WM_SETCURSOR, WS_EX_TOPMOST, WS_POPUP,
+    GetCursorPos, IDC_HAND, SetCursor, WM_MOUSEWHEEL, WM_SETCURSOR, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
@@ -84,17 +85,22 @@ pub enum Kind {
     Text,
     Note,
     Tree,
+    Choice,
 }
 
 /// One dashboard row. Page: starts a page; with two or more, tabs under the header switch them (Ctrl+Tab too).
 /// Section: title over a card; the rows after it sit on the card. Value: muted label + text, `lines` tall; with
 /// `picture` (DIP wide), the text leaves that much room at the right for an image (set_picture). Rich value: a Value
 /// whose text is colored, bold or italic spans (set_spans), for text styled like the game's own.
-/// Check: toggle switch the game owns (set_check); text after a '\t' is a muted hint by the switch (e.g. "F1").
-/// Number: whole number in lo..=hi. Text: one-line text field the value column wide, reported as typed (on_text).
+/// Check: toggle switch the game owns (set_check); text after a '\t' is a muted hint by the switch, where each
+/// `[...]` is drawn as a keycap (e.g. "[F1]", "hold [Mouse 4]"; "F1" stays plain text).
+/// Number: whole number in lo..=hi, with - and + buttons (and the mouse wheel) stepping by 1.
+/// Text: one-line text field the value column wide, reported as typed (on_text).
+/// Choice: segmented control of `options` the game owns (set_choice, on_choice); Left/Right step it.
 /// Note: full-width warning-colored text under the card (empty = blank).
 /// Tree: card-wide scrolling tree `lines` items tall with a checkbox per item; the game owns the checks (set_tree,
 /// on_tree_check). Items keep their expanded state across set_tree calls by key.
+/// Labels wider than Spec.label_width widen the label column (up to LABEL_MAX_DIP) instead of being cut.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub kind: Kind,
@@ -105,6 +111,7 @@ pub struct Row {
     pub hi: i32,
     pub picture: i32,
     pub rich: bool,
+    pub options: Vec<String>,
 }
 
 impl Row {
@@ -118,6 +125,7 @@ impl Row {
             hi: 0,
             picture: 0,
             rich: false,
+            options: Vec::new(),
         }
     }
     /// How many text lines tall (Value, Tree).
@@ -165,6 +173,34 @@ pub fn note(id: i32) -> Row {
 }
 pub fn tree(id: i32, lines: i32) -> Row {
     Row::new(Kind::Tree, id, "").lines(lines)
+}
+pub fn choice(id: i32, label: &str, options: &[&str]) -> Row {
+    Row {
+        options: options.iter().map(|&o| o.to_owned()).collect(),
+        ..Row::new(Kind::Choice, id, label)
+    }
+}
+
+/// A Check hint split into muted text and `[key]` keycaps, in order and trimmed: "hold [Mouse 4]" gives
+/// ("hold", false), ("Mouse 4", true). A '[' with no ']' after it stays text.
+fn hint_parts(hint: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut rest = hint;
+    while let Some((before, after)) = rest.split_once('[')
+        && let Some((key, tail)) = after.split_once(']')
+    {
+        out.push((before.trim(), false));
+        out.push((key.trim(), true));
+        rest = tail;
+    }
+    out.push((rest.trim(), false));
+    out.retain(|p| !p.0.is_empty());
+    out
+}
+
+/// The segment of `n` equal ones across `width` pixels that x falls in (clamped to the ends).
+fn segment_at(width: i32, n: usize, x: i32) -> usize {
+    (x.max(0) as usize * n / width.max(1) as usize).min(n.saturating_sub(1))
 }
 
 /// A run of rich value text. No colors: the theme's text color; several: a left-to-right gradient across the span.
@@ -293,10 +329,13 @@ const CLOSE: i32 = 1;
 const BADGE: i32 = 2; // the badge is clicked like a caption button
 const BADGE_PAD_DIP: i32 = 7;
 const BADGE_DOT_DIP: i32 = 6;
+const STATUS: i32 = 3; // the status header's tooltip tool
+const LABEL_MAX_DIP: i32 = 220; // past this a label is cut again, so one long label can't make the window huge
+const STEP_DIP: i32 = 28; // a Number row's - and + buttons
 
 /// A game's main window, built from a row table: its own title bar (icon, title, minimize and close), a status
-/// header, page tabs, then cards. Follows the system light/dark mode and accent color live, sizes itself to its
-/// tallest page at the window's DPI (re-layout on WM_DPICHANGED), and Tab moves focus (IsDialogMessage). All methods
+/// header, page tabs, then cards. Follows the system light/dark mode and accent color live, sizes itself to the
+/// shown page at the window's DPI (re-layout on WM_DPICHANGED), and Tab moves focus (IsDialogMessage). All methods
 /// and callbacks run on the thread that called create()/run(). Callbacks get the dashboard to call its setters, and
 /// may borrow anything that outlives it ('a).
 pub struct Dashboard<'a> {
@@ -306,6 +345,7 @@ pub struct Dashboard<'a> {
     on_number: Slot<dyn Fn(&Dashboard<'a>, i32, i32) + 'a>,
     on_text: Slot<dyn Fn(&Dashboard<'a>, i32, &str) + 'a>,
     on_tree_check: Slot<dyn Fn(&Dashboard<'a>, i32, usize, bool) + 'a>,
+    on_choice: Slot<dyn Fn(&Dashboard<'a>, i32, usize) + 'a>,
     on_badge_click: Slot<dyn Fn(&Dashboard<'a>) + 'a>,
     on_close: Slot<dyn Fn(&Dashboard<'a>) -> bool + 'a>,
     on_end_session: Slot<dyn Fn() + 'a>,
@@ -338,6 +378,10 @@ pub struct Dashboard<'a> {
     tone: Cell<Tone>,
     status_title: RefCell<String>,
     status_detail: RefCell<String>,
+    status_tip: RefCell<String>,
+    header_rect: Cell<RECT>,         // client rect, for the status tooltip
+    width: Cell<i32>,                // client width
+    page_bottoms: RefCell<Vec<i32>>, // per page: where its last row ends
     page: Cell<i32>,
     pages: Cell<i32>,
     page_of: RefCell<Vec<i32>>,       // per row
@@ -349,6 +393,8 @@ pub struct Dashboard<'a> {
     looks: RefCell<HashMap<isize, Look>>, // by HWND
     shown: RefCell<HashMap<i32, String>>, // last text per control id
     numbers: RefCell<HashMap<i32, i32>>, // last value set/applied per Number id
+    choices: RefCell<HashMap<i32, usize>>, // last set_choice per Choice id
+    steppers: RefCell<Vec<(HWND, usize, i32)>>, // Number - and + buttons: button, row, step
     setting_tree: Cell<bool>,         // lets set_tree's own check changes through TVN_ITEMCHANGING
     trees: RefCell<HashMap<i32, TreeState>>,
     _pin: PhantomPinned, // the window keeps a pointer to it
@@ -423,6 +469,7 @@ impl<'a> Dashboard<'a> {
             on_number: RefCell::new(None),
             on_text: RefCell::new(None),
             on_tree_check: RefCell::new(None),
+            on_choice: RefCell::new(None),
             on_badge_click: RefCell::new(None),
             on_close: RefCell::new(None),
             on_end_session: RefCell::new(None),
@@ -452,6 +499,10 @@ impl<'a> Dashboard<'a> {
             tone: Cell::new(Tone::Neutral),
             status_title: RefCell::new(String::new()),
             status_detail: RefCell::new(String::new()),
+            status_tip: RefCell::new(String::new()),
+            header_rect: Cell::new(RECT::default()),
+            width: Cell::new(0),
+            page_bottoms: RefCell::new(Vec::new()),
             page: Cell::new(0),
             pages: Cell::new(1),
             page_of: RefCell::new(Vec::new()),
@@ -463,6 +514,8 @@ impl<'a> Dashboard<'a> {
             looks: RefCell::new(HashMap::new()),
             shown: RefCell::new(HashMap::new()),
             numbers: RefCell::new(HashMap::new()),
+            choices: RefCell::new(HashMap::new()),
+            steppers: RefCell::new(Vec::new()),
             setting_tree: Cell::new(false),
             trees: RefCell::new(HashMap::new()),
             _pin: PhantomPinned,
@@ -490,6 +543,11 @@ impl<'a> Dashboard<'a> {
     /// set_tree. The box does not change; the game calls set_tree.
     pub fn on_tree_check(&self, f: impl Fn(&Dashboard<'a>, i32, usize, bool) + 'a) {
         *self.on_tree_check.borrow_mut() = Some(Rc::new(f));
+    }
+    /// A Choice segment clicked or Left/Right pressed on it: `index` is the option asked for. The control does not
+    /// change; the game calls set_choice.
+    pub fn on_choice(&self, f: impl Fn(&Dashboard<'a>, i32, usize) + 'a) {
+        *self.on_choice.borrow_mut() = Some(Rc::new(f));
     }
     /// false = stay open (the game calls close() later); unset = close.
     pub fn on_close(&self, f: impl Fn(&Dashboard<'a>) -> bool + 'a) {
@@ -599,6 +657,21 @@ impl<'a> Dashboard<'a> {
             self.show_page((self.page.get() + step) % pages);
             return;
         }
+        if msg.message == WM_KEYDOWN && (key == VK_LEFT.0 || key == VK_RIGHT.0) {
+            // before IsDialogMessage, which would move focus to the next control instead
+            let row = self.ctls.borrow().iter().position(|c| c.1 == msg.hwnd);
+            if let Some(i) = row.filter(|&i| self.spec.rows[i].kind == Kind::Choice) {
+                let n = self.spec.rows[i].options.len();
+                let cur = self.choices.borrow().get(&self.spec.rows[i].id).copied().unwrap_or(0);
+                let k = if key == VK_LEFT.0 {
+                    cur.saturating_sub(1)
+                } else {
+                    (cur + 1).min(n.saturating_sub(1))
+                };
+                self.pick(i, k);
+                return;
+            }
+        }
         if !h.is_invalid() && unsafe { IsDialogMessageW(h, msg) }.as_bool() {
             return; // Tab / Shift+Tab focus order
         }
@@ -628,6 +701,16 @@ impl<'a> Dashboard<'a> {
         let h = self.hwnd.get();
         if (unsafe { IsDlgButtonChecked(h, id) } == BST_CHECKED.0) != checked {
             let _ = unsafe { CheckDlgButton(h, id, if checked { BST_CHECKED } else { BST_UNCHECKED }) };
+        }
+    }
+
+    /// Shows option `index` of a Choice selected (out of range: none). Does not call on_choice.
+    pub fn set_choice(&self, id: i32, index: usize) {
+        if self.choices.borrow_mut().insert(id, index) == Some(index) {
+            return;
+        }
+        if let Ok(c) = unsafe { GetDlgItem(Some(self.hwnd.get()), id) } {
+            let _ = unsafe { InvalidateRect(Some(c), None, false) };
         }
     }
 
@@ -886,30 +969,72 @@ impl<'a> Dashboard<'a> {
         }) else {
             return;
         };
-        let mut s = wide(&self.badge.borrow().2);
-        let ti = TTTOOLINFOW {
-            cbSize: size_of::<TTTOOLINFOW>() as u32,
-            uFlags: TTF_SUBCLASS,
-            hwnd: h,
-            uId: BADGE as usize,
-            lpszText: PWSTR(s.as_mut_ptr()),
-            ..Default::default()
-        };
-        send(tip, TTM_ADDTOOLW, 0, &raw const ti as isize);
+        // the badge's rect comes with the first paint (sync_tip), the header's from layout
+        let tools = [
+            (BADGE, self.badge.borrow().2.clone(), RECT::default()),
+            (STATUS, self.status_tip.borrow().clone(), self.header_rect.get()),
+        ];
+        for (id, text, rect) in tools {
+            let mut s = wide(&text);
+            let ti = TTTOOLINFOW {
+                cbSize: size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_SUBCLASS,
+                hwnd: h,
+                uId: id as usize,
+                rect,
+                lpszText: PWSTR(s.as_mut_ptr()),
+                ..Default::default()
+            };
+            send(tip, TTM_ADDTOOLW, 0, &raw const ti as isize);
+        }
+        send(tip, TTM_SETMAXTIPWIDTH, 0, self.px(480) as isize); // long tips wrap, and '\n' breaks a line
         self.tooltip.set(tip);
     }
 
-    /// Header: colored dot + title, detail on up to two muted lines below. Repaints only on change.
+    /// The status header's hover tooltip, for details too technical for the header itself; empty: none.
+    pub fn set_status_tip(&self, tip: &str) {
+        if *self.status_tip.borrow() == tip {
+            return;
+        }
+        tip.clone_into(&mut self.status_tip.borrow_mut());
+        self.sync_status_tip();
+    }
+
+    /// Points the status tool at the header's rect with the current tip.
+    fn sync_status_tip(&self) {
+        let tip = self.tooltip.get();
+        if tip.is_invalid() {
+            return;
+        }
+        let mut s = wide(&self.status_tip.borrow());
+        let ti = TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            hwnd: self.hwnd.get(),
+            uId: STATUS as usize,
+            rect: self.header_rect.get(),
+            lpszText: PWSTR(s.as_mut_ptr()),
+            ..Default::default()
+        };
+        send(tip, TTM_NEWTOOLRECTW, 0, &raw const ti as isize);
+        send(tip, TTM_UPDATETIPTEXTW, 0, &raw const ti as isize);
+    }
+
+    /// Header: colored dot + title, detail on up to two muted lines below (empty: no room kept for it). Repaints only
+    /// on change. Technical details belong in set_status_tip.
     pub fn set_status(&self, tone: Tone, title: &str, detail: &str) {
         if tone == self.tone.get() && *self.status_title.borrow() == title && *self.status_detail.borrow() == detail {
             return;
         }
+        let gap_changed = self.status_detail.borrow().is_empty() != detail.is_empty();
         self.tone.set(tone);
         title.clone_into(&mut self.status_title.borrow_mut());
         detail.clone_into(&mut self.status_detail.borrow_mut());
         let header = self.header.get();
         if header.is_invalid() {
             return;
+        }
+        if gap_changed {
+            self.layout(None); // the header only keeps room for detail lines while there is detail
         }
         let spoken = if detail.is_empty() {
             title.to_owned()
@@ -948,6 +1073,9 @@ impl<'a> Dashboard<'a> {
                 }
             }
         }
+        for &(b, row, _) in self.steppers.borrow().iter() {
+            let _ = unsafe { ShowWindow(b, if page_of[row] == p { SW_SHOWNA } else { SW_HIDE }) };
+        }
         // A focused control that just hid would leave the keyboard nowhere.
         let h = self.hwnd.get();
         let f = unsafe { GetFocus() };
@@ -958,6 +1086,7 @@ impl<'a> Dashboard<'a> {
         {
             let _ = unsafe { SetFocus(Some(tab)) };
         }
+        self.fit(None);
         let _ = unsafe { InvalidateRect(Some(h), None, true) }; // cards
     }
 
@@ -1189,7 +1318,7 @@ impl<'a> Dashboard<'a> {
         if badge.is_empty() {
             return None;
         }
-        let (title_w, badge_w) = (self.caption_text_width(title), self.caption_text_width(&badge));
+        let (title_w, badge_w) = (self.text_width(title), self.text_width(&badge));
         let (pad, h) = (self.px(BADGE_PAD_DIP), self.px(18));
         let dot = self.px(BADGE_DOT_DIP) + self.px(5); // the tone dot and its gap before the text
         let pill = RECT {
@@ -1208,8 +1337,8 @@ impl<'a> Dashboard<'a> {
         })
     }
 
-    /// Width in pixels of `s` in the caption font.
-    fn caption_text_width(&self, s: &str) -> i32 {
+    /// Width in pixels of `s` in the body font (the caption uses it too).
+    fn text_width(&self, s: &str) -> i32 {
         let wide: Vec<u16> = s.encode_utf16().collect();
         let mut size = windows::Win32::Foundation::SIZE::default();
         unsafe {
@@ -1292,6 +1421,36 @@ impl<'a> Dashboard<'a> {
             }
         } else {
             self.hint(&format!("Enter a whole number from {} to {} (not saved).", r.lo, r.hi));
+        }
+    }
+
+    // A step button or the wheel: the field's value (else the last one, else lo) moved by `step` within lo..=hi, put
+    // in the field as if typed, so EN_CHANGE reports it through on_edit like typing does.
+    fn step(&self, i: usize, step: i32) {
+        let r = &self.spec.rows[i];
+        let field = self.ctls.borrow()[i].1;
+        let typed = parse_bounded(&window_text(field), r.lo, r.hi);
+        let base = typed
+            .or_else(|| self.numbers.borrow().get(&r.id).copied())
+            .unwrap_or(r.lo);
+        let v = base.saturating_add(step).clamp(r.lo, r.hi);
+        if typed != Some(v) {
+            let _ = unsafe { SetDlgItemInt(self.hwnd.get(), r.id, v as u32, true) };
+        }
+    }
+
+    // Asks the game for option k of Choice row i (when it isn't the shown one), then shows the answer at once.
+    fn pick(&self, i: usize, k: usize) {
+        let r = &self.spec.rows[i];
+        if k >= r.options.len() || self.choices.borrow().get(&r.id) == Some(&k) {
+            return;
+        }
+        let f = self.on_choice.borrow().clone();
+        if let Some(f) = f {
+            f(self, r.id, k);
+            if !self.hwnd.get().is_invalid() {
+                self.tick(); // on_choice may have closed the window
+            }
         }
     }
 
@@ -1418,12 +1577,23 @@ impl<'a> Dashboard<'a> {
         }
     }
 
-    // Lays out every page from the same top in DIPs scaled to the current DPI; the window fits the tallest page.
-    // Header (dot, title, two detail lines), tabs when there are 2+ pages, then section titles over cards.
+    // Lays out every page from the same top in DIPs scaled to the current DPI; the window fits the shown page (fit).
+    // Header (dot, title, two detail lines while there is detail), tabs when there are 2+ pages, then section titles
+    // over cards.
     fn layout(&self, suggested: Option<&RECT>) {
         let px = |d| self.px(d);
         let (m, pad, pad_v, row_h) = (px(16), px(14), px(6), px(34));
-        let (label_w, value_w) = (px(self.spec.label_width), px(self.spec.value_width));
+        let widest = self
+            .spec
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, Kind::Value | Kind::Number | Kind::Text | Kind::Choice))
+            .map(|r| self.text_width(&r.text))
+            .max()
+            .unwrap_or(0);
+        // a long label moves the value column right rather than being cut (labels sit px(8) short of the column)
+        let label_w = (widest + px(8)).min(px(LABEL_MAX_DIP)).max(px(self.spec.label_width));
+        let value_w = px(self.spec.value_width);
         let card_w = label_w + value_w + 2 * pad;
         let x = m + pad;
         let h = self.hwnd.get();
@@ -1433,9 +1603,10 @@ impl<'a> Dashboard<'a> {
         };
         let ctls = self.ctls.borrow().clone();
         let page_of = self.page_of.borrow().clone();
+        let steppers = self.steppers.borrow().clone();
         let n = ctls.len();
         let (mut boxes, mut slots, mut cards) = (vec![RECT::default(); n], vec![RECT::default(); n], Vec::new());
-        let bottom;
+        let mut bottoms;
         unsafe {
             let dc = GetDC(Some(h));
             let mut tm = TEXTMETRICW::default();
@@ -1447,9 +1618,20 @@ impl<'a> Dashboard<'a> {
             let line_h = tm.tmHeight;
             let text_dy = (row_h - line_h) / 2;
 
-            let header_h = big_h + px(2) + 2 * line_h;
+            let detail_h = if self.status_detail.borrow().is_empty() {
+                0
+            } else {
+                px(2) + 2 * line_h
+            };
+            let header_h = big_h + detail_h;
             let header_top = px(CAPTION_DIP) + m; // under the title bar
             let _ = MoveWindow(self.header.get(), m, header_top, card_w, header_h, false);
+            self.header_rect.set(RECT {
+                left: m,
+                top: header_top,
+                right: m + card_w,
+                bottom: header_top + header_h,
+            });
             let mut top = header_top + header_h + px(12);
             if self.pages.get() > 1 {
                 SelectObject(dc, semibold.into());
@@ -1466,8 +1648,8 @@ impl<'a> Dashboard<'a> {
                 top += px(36) + px(12);
             }
 
+            bottoms = vec![top; self.pages.get() as usize];
             let mut y = top;
-            let mut bot = top;
             let mut card_top = -1;
             let mut page = 0;
             let close_card = |y: &mut i32, card_top: &mut i32, page: i32, cards: &mut Vec<(i32, RECT)>| {
@@ -1499,7 +1681,7 @@ impl<'a> Dashboard<'a> {
                 match r.kind {
                     Kind::Page => {
                         close_card(&mut y, &mut card_top, page, &mut cards);
-                        bot = bot.max(y);
+                        bottoms[page as usize] = bottoms[page as usize].max(y);
                         page = page_of[i];
                         y = top;
                     }
@@ -1530,7 +1712,9 @@ impl<'a> Dashboard<'a> {
                     Kind::Number | Kind::Text => {
                         open_card(&mut y, &mut card_top);
                         let _ = MoveWindow(label, x, y + text_dy, label_w - px(8), line_h, false);
-                        let bw = if r.kind == Kind::Text { value_w } else { px(84) };
+                        // a Number's - and + sit inside its box, right of the field
+                        let steps = if r.kind == Kind::Number { 2 * px(STEP_DIP) } else { 0 };
+                        let bw = if r.kind == Kind::Text { value_w } else { px(84) + steps };
                         let b = RECT {
                             left: x + label_w,
                             top: y + px(3),
@@ -1542,10 +1726,24 @@ impl<'a> Dashboard<'a> {
                             ctl,
                             b.left + px(10),
                             b.top + (b.bottom - b.top - line_h) / 2,
-                            b.right - b.left - px(20),
+                            b.right - b.left - px(20) - steps,
                             line_h,
                             false,
                         );
+                        for &(btn, _, step) in steppers.iter().filter(|s| s.1 == i) {
+                            let right = b.right - px(2) - if step < 0 { px(STEP_DIP) } else { 0 };
+                            let (t, bh) = (b.top + px(3), b.bottom - b.top - px(6)); // clear of the bottom line
+                            let _ = MoveWindow(btn, right - px(STEP_DIP), t, px(STEP_DIP), bh, false);
+                        }
+                        y += rh;
+                    }
+                    Kind::Choice => {
+                        open_card(&mut y, &mut card_top);
+                        let _ = MoveWindow(label, x, y + text_dy, label_w - px(8), line_h, false);
+                        // equal segments, each as wide as the widest option needs
+                        let seg = r.options.iter().map(|o| self.text_width(o)).max().unwrap_or(0) + px(24);
+                        let cw = (seg * r.options.len().max(1) as i32).min(value_w);
+                        let _ = MoveWindow(ctl, x + label_w, y + px(3), cw, row_h - px(6), false);
                         y += rh;
                     }
                     Kind::Check => {
@@ -1567,18 +1765,35 @@ impl<'a> Dashboard<'a> {
                 }
             }
             close_card(&mut y, &mut card_top, page, &mut cards);
-            bottom = bot.max(y);
+            bottoms[page as usize] = bottoms[page as usize].max(y);
             SelectObject(dc, old);
             ReleaseDC(Some(h), dc);
         }
         *self.boxes.borrow_mut() = boxes;
         *self.slots.borrow_mut() = slots;
         *self.cards.borrow_mut() = cards;
+        *self.page_bottoms.borrow_mut() = bottoms;
+        self.width.set(m + card_w + m);
+        self.sync_status_tip();
+        self.fit(suggested);
+        let _ = unsafe { InvalidateRect(Some(h), None, true) };
+    }
+
+    // The one place the window is sized: as wide as the cards, as tall as the shown page. The top-left stays put
+    // unless a DPI change suggests a new place.
+    fn fit(&self, suggested: Option<&RECT>) {
+        let h = self.hwnd.get();
+        let bottom = self
+            .page_bottoms
+            .borrow()
+            .get(self.page.get() as usize)
+            .copied()
+            .unwrap_or(0);
         let mut rc = RECT {
             left: 0,
             top: 0,
-            right: m + card_w + m,
-            bottom: bottom + m,
+            right: self.width.get(),
+            bottom: bottom + self.px(16),
         };
         unsafe {
             let style = WINDOW_STYLE(GetWindowLongPtrW(h, GWL_STYLE) as u32);
@@ -1594,7 +1809,6 @@ impl<'a> Dashboard<'a> {
                 };
             let (sx, sy) = suggested.map_or((0, 0), |s| (s.left, s.top));
             let _ = SetWindowPos(h, None, sx, sy, rc.right - rc.left, rc.bottom - rc.top, flags);
-            let _ = InvalidateRect(Some(h), None, true);
         }
     }
 
@@ -1622,7 +1836,7 @@ impl<'a> Dashboard<'a> {
         self.header.set(child(stat, "", WS_VISIBLE.0 | SS_OWNERDRAW.0, 0));
         let mut page = 0;
         let mut seen_page = false;
-        let (mut page_of, mut ctls, mut looks) = (Vec::new(), Vec::new(), HashMap::new());
+        let (mut page_of, mut ctls, mut looks, mut steppers) = (Vec::new(), Vec::new(), HashMap::new(), Vec::new());
         let null = HWND::default();
         for r in &self.spec.rows {
             if r.kind == Kind::Page && std::mem::replace(&mut seen_page, true) {
@@ -1681,6 +1895,22 @@ impl<'a> Dashboard<'a> {
                         },
                     );
                     send(ctl, EM_SETLIMITTEXT, 6, 0);
+                    // - and +, custom drawn; no tab stop, since the keyboard types in the field itself
+                    for (glyph, step) in [("\u{2212}", -1), ("+", 1)] {
+                        steppers.push((child(button, glyph, BS_PUSHBUTTON as u32, 0), ctls.len(), step));
+                    }
+                }
+                Kind::Choice => {
+                    label = child(stat, &r.text, label_style, 0);
+                    // a real button for focus and screen readers (it reads the label); drawn as segments
+                    ctl = child(button, &r.text, BS_PUSHBUTTON as u32 | WS_TABSTOP.0, r.id);
+                    looks.insert(
+                        label.0 as isize,
+                        Look {
+                            role: Role::Muted,
+                            on_card: true,
+                        },
+                    );
                 }
                 Kind::Text => {
                     label = child(stat, &r.text, label_style, 0);
@@ -1732,6 +1962,7 @@ impl<'a> Dashboard<'a> {
         *self.page_of.borrow_mut() = page_of;
         *self.ctls.borrow_mut() = ctls;
         *self.looks.borrow_mut() = looks;
+        *self.steppers.borrow_mut() = steppers;
         *self.boxes.borrow_mut() = vec![RECT::default(); n];
         *self.slots.borrow_mut() = vec![RECT::default(); n];
         self.theme_trees();
@@ -2060,10 +2291,17 @@ impl<'a> Dashboard<'a> {
         canvas.end();
     }
 
-    // Page tabs and toggle switches stay real buttons (focus, Space, screen readers); only their look is ours.
+    // Page tabs, toggle switches, choices and number steps stay real buttons (focus, Space, screen readers); only
+    // their look is ours. A Number row's buttons are its steps (its own control is an edit, which draws itself).
     fn custom_draw(&self, cd: &NMCUSTOMDRAW) -> LRESULT {
         let ctls = self.ctls.borrow().clone();
-        let Some(i) = ctls.iter().position(|c| c.1 == cd.hdr.hwndFrom) else {
+        let stepper = self
+            .steppers
+            .borrow()
+            .iter()
+            .find(|s| s.0 == cd.hdr.hwndFrom)
+            .map(|s| s.1);
+        let Some(i) = stepper.or_else(|| ctls.iter().position(|c| c.1 == cd.hdr.hwndFrom)) else {
             return LRESULT(CDRF_DODEFAULT as isize);
         };
         let r = &self.spec.rows[i];
@@ -2097,7 +2335,40 @@ impl<'a> Dashboard<'a> {
             (f.text[0].clone(), f.semibold_text.clone())
         };
 
-        if r.kind == Kind::Page {
+        if r.kind == Kind::Number {
+            // a NumberBox spin button: flat on the field, a subtle fill under the mouse
+            canvas.fill(&rect_f(&rc), theme.field, 1.0);
+            if hot {
+                canvas.round_rect(&rect_f(&rc), px(3), blend(theme.text, theme.field, 0.08), None);
+            }
+            canvas.text(&full, body.as_ref(), &rect_f(&rc), theme.text2, Align::Center, false);
+        } else if r.kind == Kind::Choice {
+            // Windows 11 segmented control: one rounded field, the selected segment filled with the accent
+            canvas.fill(&rect_f(&rc), theme.card, 1.0);
+            let fill = if hot {
+                blend(theme.text, theme.field, 0.05)
+            } else {
+                theme.field
+            };
+            let edge = if focus { theme.text } else { theme.stroke };
+            canvas.round_rect(&rect_f(&rc), px(4), fill, Some(edge));
+            let sel = self.choices.borrow().get(&r.id).copied();
+            let seg = (right - left) / r.options.len().max(1) as f32;
+            for (k, o) in r.options.iter().enumerate() {
+                let s = rf(left + seg * k as f32, top, left + seg * (k + 1) as f32, bottom);
+                let on = sel == Some(k);
+                if on {
+                    let inner = rf(s.left + px(2), s.top + px(2), s.right - px(2), s.bottom - px(2));
+                    canvas.round_rect(&inner, px(3), theme.accent, None);
+                }
+                let (format, ink) = if on {
+                    (semibold.as_ref(), theme.on_accent)
+                } else {
+                    (body.as_ref(), theme.text)
+                };
+                canvas.text(o, format, &s, ink, Align::Center, false);
+            }
+        } else if r.kind == Kind::Page {
             let selected = self.page_of.borrow()[i] == self.page.get();
             let cx = (left + right) / 2.0;
             canvas.fill(&rect_f(&rc), theme.bg, 1.0);
@@ -2164,9 +2435,38 @@ impl<'a> Dashboard<'a> {
                 knob / 2.0,
                 if on { theme.on_accent } else { theme.text2 },
             );
-            let t = rf(left, top, sx - px(12), bottom);
-            canvas.text(text, body.as_ref(), &t, theme.text, Align::Left, false);
-            canvas.text(hint, body.as_ref(), &t, theme.text2, Align::Right, false);
+            // the hint right to left from the switch: muted words, `[key]` parts as keycaps
+            let end = sx - px(12);
+            let mut hx = end;
+            for (part, key) in hint_parts(hint).into_iter().rev() {
+                let w = self.text_width(part) as f32;
+                if key {
+                    let (cw, ch) = (w + px(12), px(22));
+                    let cap = rf(hx - cw, (top + bottom - ch) / 2.0, hx, (top + bottom + ch) / 2.0);
+                    canvas.round_rect(&cap, px(4), theme.field, Some(theme.stroke));
+                    canvas.text(part, body.as_ref(), &cap, theme.text, Align::Center, false);
+                    hx -= cw + px(5);
+                } else {
+                    canvas.text(
+                        part,
+                        body.as_ref(),
+                        &rf(left, top, hx, bottom),
+                        theme.text2,
+                        Align::Right,
+                        false,
+                    );
+                    hx -= w + px(5);
+                }
+            }
+            let label_right = if hx < end { hx - px(3) } else { end };
+            canvas.text(
+                text,
+                body.as_ref(),
+                &rf(left, top, label_right, bottom),
+                theme.text,
+                Align::Left,
+                false,
+            );
         }
         canvas.end();
         LRESULT(CDRF_SKIPDEFAULT as isize)
@@ -2228,6 +2528,24 @@ impl<'a> Dashboard<'a> {
                     }
                 }
                 LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                // over a Number box (the field and its buttons pass the wheel up): step it
+                let mut p = point_of(lp);
+                let _ = unsafe { ScreenToClient(h, &mut p) };
+                let page_of = self.page_of.borrow().clone();
+                let at = self.boxes.borrow().iter().enumerate().position(|(i, b)| {
+                    self.spec.rows[i].kind == Kind::Number
+                        && page_of[i] == self.page.get()
+                        && unsafe { PtInRect(b, p) }.as_bool()
+                });
+                match at {
+                    Some(i) => {
+                        self.step(i, if hiword(wp.0) as i16 > 0 { 1 } else { -1 });
+                        LRESULT(0)
+                    }
+                    None => def(),
+                }
             }
             WM_MOUSELEAVE => {
                 self.cap_hot.set(-1);
@@ -2427,6 +2745,12 @@ impl<'a> Dashboard<'a> {
     }
 
     fn command(&self, id: i32, code: u32, from: HWND) {
+        let stepper = self.steppers.borrow().iter().find(|s| s.0 == from).copied();
+        if let Some((_, i, step)) = stepper
+            && code == BN_CLICKED
+        {
+            return self.step(i, step);
+        }
         let ctls = self.ctls.borrow().clone();
         for (i, r) in self.spec.rows.iter().enumerate() {
             // Only the row's own control: IsDialogMessage sends Enter/Esc as IDOK/IDCANCEL (ids 1/2) with no hwnd.
@@ -2448,6 +2772,22 @@ impl<'a> Dashboard<'a> {
                             self.tick(); // show the new state now; on_check may have closed the window
                         }
                     }
+                }
+                Kind::Choice if code == BN_CLICKED => {
+                    // the segment under the mouse; Space (mouse elsewhere) moves to the next option
+                    let n = r.options.len();
+                    let (mut p, mut rc) = (POINT::default(), RECT::default());
+                    unsafe {
+                        let _ = GetCursorPos(&mut p);
+                        let _ = ScreenToClient(from, &mut p);
+                        let _ = GetClientRect(from, &mut rc);
+                    }
+                    let k = if unsafe { PtInRect(&rc, p) }.as_bool() {
+                        segment_at(rc.right, n, p.x)
+                    } else {
+                        self.choices.borrow().get(&id).map_or(0, |&k| (k + 1) % n.max(1))
+                    };
+                    self.pick(i, k);
                 }
                 Kind::Number => {
                     if code == EN_CHANGE || code == EN_KILLFOCUS {
@@ -2528,7 +2868,7 @@ mod tests {
         GetObjectW, RDW_UPDATENOW, UpdateWindow,
     };
     use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
-    use windows::Win32::UI::Controls::TTM_GETTOOLCOUNT;
+    use windows::Win32::UI::Controls::{TTM_GETTEXTW, TTM_GETTOOLCOUNT};
     use windows::Win32::UI::Controls::{
         TVE_COLLAPSE, TVGN_CHILD, TVGN_NEXT, TVGN_ROOT, TVIS_EXPANDED, TVM_GETCOUNT, TVM_GETITEMSTATE, TVM_GETITEMW,
         TVM_GETNEXTITEM,
@@ -2634,7 +2974,7 @@ mod tests {
         assert!(d.create());
         let cap = d.px(CAPTION_DIP);
         let (pill, text) = d.badge_rects(d.px(38), cap, "t").expect("fits");
-        assert!(pill.left > d.px(38) + d.caption_text_width("t")); // a gap after the title
+        assert!(pill.left > d.px(38) + d.text_width("t")); // a gap after the title
         assert!(pill.top > 0 && pill.bottom < cap); // inside the caption, centered
         assert_eq!(pill.bottom - pill.top, d.px(18));
         assert!(text.left > pill.left && text.right == pill.right);
@@ -2681,8 +3021,8 @@ mod tests {
         send(h, WM_LBUTTONDOWN, 1, on);
         send(h, WM_LBUTTONUP, 0, make_lparam(pill.right + d.px(10), cy));
         assert_eq!(clicks.get(), 1);
-        // the tooltip has one tool, on the badge
-        assert_eq!(send(d.tooltip.get(), TTM_GETTOOLCOUNT, 0, 0).0, 1);
+        // the tooltip has two tools: the badge and the status header
+        assert_eq!(send(d.tooltip.get(), TTM_GETTOOLCOUNT, 0, 0).0, 2);
         d.set_badge("v1.2.3 \u{b7} v1.2.4 ready", Tone::Busy, "Click to restart");
         assert_eq!(d.tip_rect.get(), d.badge_pill().unwrap());
     }
@@ -3146,5 +3486,171 @@ mod tests {
         }
         assert!(card > 1000, "{card}"); // the card behind the rows
         assert!(accent > 50, "{accent}"); // the switch's track
+    }
+
+    #[test]
+    fn dashboard_status_tip_and_header_gap() {
+        let d = Dashboard::new(spec(vec![value(1, "Status")]));
+        assert!(d.create());
+        let header_h = || {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(d.header.get(), &mut r) }.unwrap();
+            r.bottom - r.top
+        };
+        d.set_status(Tone::Good, "Ready", "Attached");
+        let with_detail = header_h();
+        d.set_status(Tone::Good, "Ready", "");
+        assert!(header_h() < with_detail); // no blank detail lines
+        d.set_status(Tone::Good, "Ready", "Attached");
+        assert_eq!(header_h(), with_detail);
+        d.set_status_tip("version-abc (C:\\x), Dumped At 1");
+        assert_eq!(d.header_rect.get().bottom - d.header_rect.get().top, with_detail);
+        let mut buf = [0u16; 128];
+        let mut ti = TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            hwnd: d.hwnd(),
+            uId: STATUS as usize,
+            lpszText: PWSTR(buf.as_mut_ptr()),
+            ..Default::default()
+        };
+        send(d.tooltip.get(), TTM_GETTEXTW, buf.len(), &raw mut ti as isize);
+        assert_eq!(from_wide(&buf), "version-abc (C:\\x), Dumped At 1");
+    }
+
+    #[test]
+    fn dashboard_fits_the_shown_page() {
+        let d = Dashboard::new(spec(vec![
+            page("Short"),
+            value(1, "Status"),
+            page("Tall"),
+            value(2, "A"),
+            value(3, "B"),
+            value(4, "C"),
+            value(5, "D"),
+        ]));
+        assert!(d.create());
+        let rect = || {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(d.hwnd(), &mut r) }.unwrap();
+            r
+        };
+        let short = rect();
+        d.show_page(1);
+        let tall = rect();
+        assert!(tall.bottom - tall.top > short.bottom - short.top + d.px(100));
+        assert_eq!((tall.left, tall.top, tall.right), (short.left, short.top, short.right)); // top-left stays
+        d.show_page(0);
+        assert_eq!(rect(), short);
+    }
+
+    #[test]
+    fn dashboard_long_label_widens_the_column() {
+        let label = "Max studs (0 = any)";
+        let d = Dashboard::new(Spec {
+            label_width: 40,
+            ..spec(vec![number(1, label, 0, 100), value(2, "Short")])
+        });
+        assert!(d.create());
+        let label_w = |id_row: usize| {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(d.ctls.borrow()[id_row].0, &mut r) }.unwrap();
+            r.right - r.left
+        };
+        assert!(label_w(0) >= d.text_width(label)); // not cut
+        assert_eq!(label_w(1), label_w(0)); // one column for all
+        let huge = Dashboard::new(spec(vec![value(1, &"x".repeat(300))]));
+        assert!(huge.create());
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(huge.ctls.borrow()[0].0, &mut r) }.unwrap();
+        assert_eq!(r.right - r.left, huge.px(LABEL_MAX_DIP) - huge.px(8)); // capped
+    }
+
+    #[test]
+    fn hint_parts_split_keycaps() {
+        assert_eq!(hint_parts("F1"), [("F1", false)]);
+        assert_eq!(hint_parts("[F1]"), [("F1", true)]);
+        assert_eq!(hint_parts("hold [Mouse 4]"), [("hold", false), ("Mouse 4", true)]);
+        assert_eq!(
+            hint_parts("press [Ctrl] + [F2] now"),
+            [
+                ("press", false),
+                ("Ctrl", true),
+                ("+", false),
+                ("F2", true),
+                ("now", false)
+            ]
+        );
+        assert_eq!(hint_parts("a [b"), [("a [b", false)]); // unclosed: text
+        assert!(hint_parts("").is_empty());
+    }
+
+    #[test]
+    fn segment_at_splits_evenly() {
+        assert_eq!(segment_at(300, 3, 0), 0);
+        assert_eq!(segment_at(300, 3, 99), 0);
+        assert_eq!(segment_at(300, 3, 100), 1);
+        assert_eq!(segment_at(300, 3, 299), 2);
+        assert_eq!(segment_at(300, 3, 400), 2); // clamped
+        assert_eq!(segment_at(300, 3, -5), 0);
+        assert_eq!(segment_at(300, 0, 10), 0); // no options: no panic
+    }
+
+    #[test]
+    fn dashboard_choice_keys_report_and_set_choice_shows() {
+        let picks = RefCell::new(Vec::new());
+        let d = Dashboard::new(spec(vec![choice(7, "Mode", &["Off", "Aim", "Lock"])]));
+        d.on_choice(|d, id, k| {
+            picks.borrow_mut().push((id, k));
+            d.set_choice(id, k); // the game takes it
+        });
+        assert!(d.create());
+        let key = |vk: u16| {
+            let msg = MSG {
+                hwnd: item(d.hwnd(), 7),
+                message: WM_KEYDOWN,
+                wParam: WPARAM(vk as usize),
+                ..Default::default()
+            };
+            d.dispatch(&msg);
+        };
+        d.set_choice(7, 0);
+        assert!(picks.borrow().is_empty()); // set_choice does not echo back
+        key(VK_RIGHT.0);
+        key(VK_RIGHT.0);
+        key(VK_RIGHT.0); // already the last: nothing
+        key(VK_LEFT.0);
+        assert_eq!(*picks.borrow(), [(7, 1), (7, 2), (7, 1)]);
+        assert_eq!(d.choices.borrow()[&7], 1);
+    }
+
+    #[test]
+    fn dashboard_number_steps_with_buttons_and_wheel() {
+        let numbers = RefCell::new(Vec::new());
+        let d = Dashboard::new(spec(vec![number(10, "Latency", 0, 100)]));
+        d.on_number(|_, id, v| numbers.borrow_mut().push((id, v)));
+        assert!(d.create());
+        let h = d.hwnd();
+        let (minus, plus) = {
+            let s = d.steppers.borrow();
+            (s[0].0, s[1].0)
+        };
+        let click = |b: HWND| send(h, WM_COMMAND, (BN_CLICKED as usize) << 16, b.0 as isize);
+        d.set_number(10, 99);
+        click(plus);
+        click(plus); // at hi: stays
+        assert_eq!(text_of(h, 10), "100");
+        click(minus);
+        assert_eq!(*numbers.borrow(), [(10, 100), (10, 99)]);
+        // the wheel over the box steps too; elsewhere it does nothing
+        let b = d.boxes.borrow()[0];
+        let wheel = |x: i32, y: i32, delta: i16| {
+            let mut p = POINT { x, y };
+            let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(h, &mut p) };
+            send(h, WM_MOUSEWHEEL, (delta as u16 as usize) << 16, make_lparam(p.x, p.y));
+        };
+        wheel(b.left + 2, (b.top + b.bottom) / 2, -120);
+        assert_eq!(text_of(h, 10), "98");
+        wheel(b.left + 2, b.bottom + d.px(40), 120);
+        assert_eq!(*numbers.borrow(), [(10, 100), (10, 99), (10, 98)]);
     }
 }

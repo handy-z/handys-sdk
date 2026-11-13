@@ -91,7 +91,8 @@ pub enum Kind {
 
 /// One dashboard row. Page: starts a page; with two or more, tabs under the header switch them (Ctrl+Tab too).
 /// Section: title over a card; the rows after it sit on the card. Value: muted label + text, `lines` tall; with
-/// `picture` (DIP wide), the text leaves that much room at the right for an image (set_picture). Rich value: a Value
+/// `picture` (DIP wide), the text leaves that much room at the right for an image (set_picture). A '\t' in rich text
+/// starts a second column halfway across (stats two to a line). Rich value: a Value
 /// whose text is colored, bold or italic spans (set_spans), for text styled like the game's own.
 /// Check: toggle switch the game owns (set_check); text after a '\t' is a muted hint by the switch, where each
 /// `[...]` is drawn as a keycap (e.g. "[F1]", "hold [Mouse 4]"; "F1" stays plain text).
@@ -2397,6 +2398,8 @@ impl<'a> Dashboard<'a> {
             let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
             let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            // a '\t' starts the second column halfway across, so rich values can lay stats out two per line
+            let _ = layout.SetIncrementalTabStop(w / 2.0);
             let trim = DWRITE_TRIMMING {
                 granularity: if one_line {
                     DWRITE_TRIMMING_GRANULARITY_CHARACTER

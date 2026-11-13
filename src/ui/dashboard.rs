@@ -53,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ES_AUTOHSCROLL, ES_NUMBER, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GWL_EXSTYLE, GWL_STYLE,
     GWLP_USERDATA, GetClientRect, GetDlgItem, GetDlgItemTextW, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
     GetWindowTextW, HICON, HMENU, HTCAPTION, HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDI_APPLICATION, IsChild,
-    IsDialogMessageW, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MSG, MoveWindow, NCCALCSIZE_PARAMS,
+    IsDialogMessageW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MSG, MoveWindow, NCCALCSIZE_PARAMS,
     NONCLIENTMETRICSW, PostQuitMessage, RegisterClassExW, SC_CLOSE, SC_MINIMIZE, SHOW_WINDOW_CMD, SM_CXICON,
     SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetDlgItemInt,
     SetDlgItemTextW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
@@ -661,6 +661,19 @@ impl<'a> Dashboard<'a> {
             .position(|r| r.id == id && r.kind == Kind::Value)?;
         let s = *self.slots.borrow().get(i)?;
         (!is_empty(&s)).then(|| ((s.right - s.left) as u32, (s.bottom - s.top) as u32))
+    }
+
+    /// Whether a Value row's picture can be seen now: the window shown, not minimized, and the row on the current page.
+    /// Cheap enough to call every tick before rendering into it.
+    pub fn picture_visible(&self, id: i32) -> bool {
+        let h = self.hwnd.get();
+        let on_page = self
+            .spec
+            .rows
+            .iter()
+            .position(|r| r.id == id && r.kind == Kind::Value)
+            .is_some_and(|i| self.page_of.borrow().get(i) == Some(&self.page.get()));
+        on_page && unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() }
     }
 
     /// Shows premultiplied BGRA pixels (w x h, as raster::render makes them) as that row's picture, replacing any image;
@@ -2522,8 +2535,8 @@ mod tests {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowRect, IsWindow, PM_NOREMOVE, PW_RENDERFULLCONTENT, PeekMessageW, SW_SHOWNOACTIVATE,
-        WM_GETFONT, WM_QUIT,
+        FindWindowExW, GetWindowRect, IsWindow, PM_NOREMOVE, PW_RENDERFULLCONTENT, PeekMessageW, SW_SHOWMINNOACTIVE,
+        SW_SHOWNOACTIVATE, WM_GETFONT, WM_QUIT,
     };
 
     fn spec(rows: Vec<Row>) -> Spec {
@@ -2861,6 +2874,25 @@ mod tests {
         assert!(d.set_picture(2, &bmp, None)); // same file as before the pixels: read again, not "unchanged"
         assert!(d.pictures.borrow()[&2].0 == bmp);
         let _ = std::fs::remove_file(&bmp);
+    }
+
+    #[test]
+    fn dashboard_picture_visible() {
+        let d = Dashboard::new(spec(vec![
+            page("Main"),
+            value(1, "Fish").picture(96),
+            page("Settings"),
+            value(2, "Other").picture(96),
+        ]));
+        assert!(d.create());
+        assert!(!d.picture_visible(1)); // the window isn't shown yet
+        let _ = unsafe { ShowWindow(d.hwnd(), SW_SHOWNA) };
+        assert!(d.picture_visible(1) && !d.picture_visible(2));
+        d.show_page(1);
+        assert!(!d.picture_visible(1) && d.picture_visible(2));
+        assert!(!d.picture_visible(3)); // no such row
+        let _ = unsafe { ShowWindow(d.hwnd(), SW_SHOWMINNOACTIVE) };
+        assert!(!d.picture_visible(2));
     }
 
     #[test]

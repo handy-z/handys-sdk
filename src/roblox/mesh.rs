@@ -45,12 +45,15 @@ const VERTEX_STRIDE: usize = 40;
 const UNION_ITEM_DATA: usize = 0x28;
 const UNION_DATA_MESH: usize = 0xd8;
 const UNION_POSITIONS: usize = 0x40;
+const UNION_NORMALS: usize = 0x58;
 const UNION_UVS: usize = 0xa0;
 const UNION_INDICES: usize = 0xd0;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
+    /// One per position, or empty when unknown.
+    pub normals: Vec<[f32; 3]>,
     pub tris: Vec<[u32; 3]>,
 }
 
@@ -102,12 +105,13 @@ fn read_vec<T: Pod + Default>(m: &dyn Memory, begin: usize, n: usize) -> Option<
     m.read_slice(begin, &mut v).then_some(v)
 }
 
-fn checked(positions: Vec<[f32; 3]>, tris: Vec<[u32; 3]>) -> Option<Mesh> {
+fn checked(positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>, tris: Vec<[u32; 3]>) -> Option<Mesh> {
     let n = positions.len() as u32;
-    tris.iter()
-        .flatten()
-        .all(|i| *i < n)
-        .then_some(Mesh { positions, tris })
+    tris.iter().flatten().all(|i| *i < n).then_some(Mesh {
+        positions,
+        normals,
+        tris,
+    })
 }
 
 fn mesh_part_mesh(m: &dyn Memory, o: &Offsets, item: usize) -> Option<Mesh> {
@@ -120,7 +124,11 @@ fn mesh_part_mesh(m: &dyn Memory, o: &Offsets, item: usize) -> Option<Mesh> {
     let (fb, fe) = (field("FileMeshData.Faces"), field("FileMeshData.FacesEnd"));
     let verts: Vec<[f32; VERTEX_STRIDE / 4]> = read_vec(m, vb, count(vb, ve, VERTEX_STRIDE)?)?;
     let tris = read_vec(m, fb, count(fb, fe, 12)?)?;
-    checked(verts.iter().map(|v| [v[0], v[1], v[2]]).collect(), tris)
+    checked(
+        verts.iter().map(|v| [v[0], v[1], v[2]]).collect(),
+        verts.iter().map(|v| [v[3], v[4], v[5]]).collect(),
+        tris,
+    )
 }
 
 fn union_mesh(m: &dyn Memory, item: usize) -> Option<Mesh> {
@@ -128,13 +136,18 @@ fn union_mesh(m: &dyn Memory, item: usize) -> Option<Mesh> {
     if mesh == 0 {
         return None;
     }
-    // One read covers the three vectors' begin/end pointers.
+    // One read covers the four vectors' begin/end pointers.
     let mut h = [0usize; (UNION_INDICES + 16 - UNION_POSITIONS) / 8];
     if !m.read_slice(mesh + UNION_POSITIONS, &mut h) {
         return None;
     }
     let vec_at = |off: usize| (h[(off - UNION_POSITIONS) / 8], h[(off - UNION_POSITIONS) / 8 + 1]);
-    let ((pb, pe), (ub, ue), (ib, ie)) = (vec_at(UNION_POSITIONS), vec_at(UNION_UVS), vec_at(UNION_INDICES));
+    let ((pb, pe), (nb, ne), (ub, ue), (ib, ie)) = (
+        vec_at(UNION_POSITIONS),
+        vec_at(UNION_NORMALS),
+        vec_at(UNION_UVS),
+        vec_at(UNION_INDICES),
+    );
     let n = count(pb, pe, 12)?;
     // The uv vector running parallel to positions is what tells this layout apart from some other object.
     if count(ub, ue, 8)? != n {
@@ -142,7 +155,12 @@ fn union_mesh(m: &dyn Memory, item: usize) -> Option<Mesh> {
     }
     let positions = read_vec(m, pb, n)?;
     let tris = read_vec(m, ib, count(ib, ie, 12)?)?;
-    checked(positions, tris)
+    // Normals are a nicety: a mismatched or unreadable vector only loses smooth shading.
+    let normals = (count(nb, ne, 12) == Some(n))
+        .then(|| read_vec(m, nb, n))
+        .flatten()
+        .unwrap_or_default();
+    checked(positions, normals, tris)
 }
 
 /// The decoded meshes for `wanted` ids (id, is_union) from the game's caches: walks each needed provider's LRU once
@@ -267,19 +285,20 @@ mod tests {
         m.put_ptr(item + 0x28, fmd);
         let verts: Vec<[f32; 10]> = TRI
             .iter()
-            .map(|p| [p[0], p[1], p[2], 9., 9., 9., 9., 9., 9., 9.])
+            .map(|p| [p[0], p[1], p[2], 0., 0., 1., 9., 9., 9., 9.])
             .collect();
         put_vec(m, fmd, &verts);
         put_vec(m, fmd + 0x30, &[[0u32, 1, 2]]);
         item
     }
 
-    fn union_item(m: &mut FakeMemory, indices: &[u32]) -> usize {
+    fn union_item(m: &mut FakeMemory, indices: &[u32], normals: &[[f32; 3]]) -> usize {
         let (item, data, mesh) = (m.alloc(0x30), m.alloc(0xe0), m.alloc(0xe0));
         m.put_ptr(item + UNION_ITEM_DATA, data);
         m.put_ptr(data + UNION_DATA_MESH, mesh);
         m.put(mesh + UNION_POSITIONS, &[0; UNION_INDICES + 16 - UNION_POSITIONS]);
         put_vec(m, mesh + UNION_POSITIONS, &TRI);
+        put_vec(m, mesh + UNION_NORMALS, normals);
         put_vec(m, mesh + UNION_UVS, &[[0f32; 2]; 3]);
         put_vec(m, mesh + UNION_INDICES, indices);
         item
@@ -288,22 +307,25 @@ mod tests {
     const URL: &str = "https://assetdelivery.roblox.com/v1/asset?id=";
 
     // A DataModel with a MeshPart mesh (id 111, behind an unrelated node 999) and a union mesh (id 222).
-    fn world(m: &mut FakeMemory, union_indices: &[u32]) -> usize {
+    fn world(m: &mut FakeMemory, union_indices: &[u32], union_normals: &[[f32; 3]]) -> usize {
         let item = mesh_part_item(m);
         let wanted = lru_node(m, &format!("{URL}111"), item, 0);
         let other_item = mesh_part_item(m);
         let other = lru_node(m, &format!("{URL}999"), other_item, wanted);
         let mp = provider(m, "MeshContentProvider", other);
-        let uitem = union_item(m, union_indices);
+        let uitem = union_item(m, union_indices, union_normals);
         let un = lru_node(m, &format!("{URL}222"), uitem, 0);
         let sp = provider(m, "SolidModelContentProvider", un);
         let ws = m.instance("Workspace", "Workspace", &[]);
         m.instance("DataModel", "Game", &[ws, mp, sp])
     }
 
+    const UP: [[f32; 3]; 3] = [[0.0, 0.0, 1.0]; 3];
+
     fn tri_mesh() -> Mesh {
         Mesh {
             positions: TRI.to_vec(),
+            normals: UP.to_vec(),
             tris: vec![[0, 1, 2]],
         }
     }
@@ -311,11 +333,16 @@ mod tests {
     #[test]
     fn mesh_cached_finds_both_kinds_by_id() {
         let (mut m, o) = (FakeMemory::default(), offs());
-        let dm = world(&mut m, &[0, 1, 2]);
+        let dm = world(&mut m, &[0, 1, 2], &UP);
         let got = cached_meshes(&m, &o, dm, &[(111, false), (222, true), (333, false)]);
         assert_eq!(got.len(), 2);
         assert_eq!(got[&111], tri_mesh());
         assert_eq!(got[&222], tri_mesh());
+        // A normal vector of the wrong length still gives the mesh, just without normals.
+        let dm = world(&mut m, &[0, 1, 2], &UP[..2]);
+        let got = cached_meshes(&m, &o, dm, &[(222, true)]);
+        assert_eq!(got[&222].positions, TRI.to_vec());
+        assert!(got[&222].normals.is_empty());
         // The union id is looked up only in the union cache.
         assert!(cached_meshes(&m, &o, dm, &[(222, false)]).is_empty());
     }
@@ -323,9 +350,9 @@ mod tests {
     #[test]
     fn mesh_cached_rejects_bad_union() {
         let (mut m, o) = (FakeMemory::default(), offs());
-        let dm = world(&mut m, &[0, 1, 3]);
+        let dm = world(&mut m, &[0, 1, 3], &UP);
         assert!(cached_meshes(&m, &o, dm, &[(222, true)]).is_empty());
-        let dm = world(&mut m, &[0, 1]); // not whole triangles
+        let dm = world(&mut m, &[0, 1], &UP); // not whole triangles
         assert!(cached_meshes(&m, &o, dm, &[(222, true)]).is_empty());
     }
 
@@ -345,7 +372,7 @@ mod tests {
     #[test]
     fn mesh_read_cost() {
         let (mut m, o) = (FakeMemory::default(), offs());
-        let dm = world(&mut m, &[0, 1, 2]);
+        let dm = world(&mut m, &[0, 1, 2], &UP);
         let p = child_by_class(&m, &o, dm, "MeshContentProvider");
         m.reads.set(0);
         child_by_class(&m, &o, dm, "MeshContentProvider");
@@ -360,6 +387,14 @@ mod tests {
         cached_meshes(&m, &o, dm, &[(111, false)]);
         // provider lookup, holder/cache/head, two nodes, then item, fmd, four vector pointers, two slices.
         assert_eq!(m.reads.get(), find + 3 + 2 * per_node + 8);
+        m.reads.set(0);
+        child_by_class(&m, &o, dm, "SolidModelContentProvider");
+        let find = m.reads.get();
+        m.reads.set(0);
+        cached_meshes(&m, &o, dm, &[(222, true)]);
+        // provider lookup, holder/cache/head, one node, then item, data, mesh, the vector header, three slices (the
+        // normals one is new; positions, tris and normals are separate heap blocks).
+        assert_eq!(m.reads.get(), find + 3 + per_node + 7);
     }
 
     #[test]
@@ -391,7 +426,7 @@ mod tests {
     #[test]
     fn mesh_missing_keys_give_nothing() {
         let (mut m, mut o) = (FakeMemory::default(), offs());
-        let dm = world(&mut m, &[0, 1, 2]);
+        let dm = world(&mut m, &[0, 1, 2], &UP);
         let mp = m.instance("MeshPart", "M", &[]);
         put_str(&mut m, mp + 0x60, "rbxassetid://1");
         o.values.remove("FileMeshData.FacesEnd");

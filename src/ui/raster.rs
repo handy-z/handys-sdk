@@ -60,8 +60,9 @@ impl Texture {
 }
 
 /// How the triangles are seen: a perspective camera with this vertical field of view (radians; 0 for orthographic),
-/// and Roblox-style light: `ambient` plus `color` times the diffuse term of a light shining along `dir` (camera
-/// space), each channel 0..1 and the sum clamped.
+/// and Roblox-style light: `ambient` plus `color` times the diffuse term of a light lying toward `dir` (camera
+/// space; as a ViewportFrame's LightDirection, "the direction of the light source", not the way its light travels),
+/// each channel 0..1 and the sum clamped.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scene {
     pub fov: f32,
@@ -214,7 +215,7 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
             q[2],
         ]
     };
-    let toward_light = unit(scene.dir.map(|v| -v)).unwrap_or([0.0, 0.0, 1.0]);
+    let toward_light = unit(scene.dir).unwrap_or([0.0, 0.0, 1.0]);
     let mut depth = vec![f32::NEG_INFINITY; sw * sh];
     let mut color = vec![0u32; sw * sh];
     let mut cover = vec![0u8; sw * sh]; // 255 under a solid surface, less under see-through ones only
@@ -452,8 +453,17 @@ mod tests {
         tri([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], 0xff8000, glow)
     }
 
+    // lit from the camera's side (up, right and in front), as the tests' colors were tuned
+    const FRONT_LIT: Scene = Scene {
+        fov: 0.0,
+        ambient: [200.0 / 255.0; 3],
+        color: [140.0 / 255.0; 3],
+        dir: [1.0, 1.0, 1.0],
+        time: 0.0,
+    };
+
     fn r(tris: &[Tri], w: u32, h: u32) -> Vec<u8> {
-        render(tris, &[], &Scene::default(), w, h)
+        render(tris, &[], &FRONT_LIT, w, h)
     }
 
     fn px(buf: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
@@ -611,12 +621,23 @@ mod tests {
     }
 
     #[test]
+    fn dir_points_toward_the_light() {
+        // as a ViewportFrame's LightDirection: a face toward the camera is lit when dir points at the camera
+        let lit = |dir| {
+            let scene = Scene { dir, ..FRONT_LIT };
+            px(&render(&[big(false)], &[], &scene, 30, 30), 30, 15, 16)[1] // green: the orange's red is already full
+        };
+        let (front, back) = (lit([0.0, 0.0, 1.0]), lit([0.0, 0.0, -1.0]));
+        assert!(u32::from(front) > u32::from(back) + 10, "{front} {back}");
+    }
+
+    #[test]
     fn shine_adds_a_glint() {
         // a ball lit from the front: the glossy one is brighter where the light reflects at the camera
         let dull = sphere(true);
         let glossy: Vec<Tri> = dull.iter().map(|t| Tri { shine: 1.0, ..*t }).collect();
         let scene = Scene {
-            dir: [0.0, 0.0, -1.0],
+            dir: [0.0, 0.0, 1.0], // the light is where the camera is
             ambient: [0.2; 3],
             color: [0.4; 3], // dim: the default light already whitens a light grey
             ..Scene::default()
@@ -704,7 +725,7 @@ mod tests {
             tex: 1,
             ..tri(p, 0x0000ff, false)
         });
-        let b = render(&quad, &[tex], &Scene::default(), 40, 40);
+        let b = render(&quad, &[tex], &FRONT_LIT, 40, 40);
         let [bl, g, red, _] = px(&b, 40, 8, 20);
         assert!(red > 200 && g < 20 && bl < 20, "{red} {g} {bl}");
         let [bl, g, red, _] = px(&b, 40, 31, 20);

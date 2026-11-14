@@ -87,6 +87,9 @@ impl Default for Scene {
 }
 
 const SS: usize = 3; // samples per pixel along each axis, box-filtered down for smooth edges
+// shortcut: a guess fitted to one live case (an Enchant Relic's Neon rune sits 2.5% of the relic's size under its
+// stone's face, yet the game shows it); measure again if glowing parts show through where the game hides them
+const GLOW_DEPTH_TOLERANCE: f32 = 0.04; // of the model's size: how far under a surface a glow surface still shows
 const GLOW_AMBIENT: f32 = 0.7; // Neon: mostly its own light, a little shape kept so it doesn't read as a flat silhouette
 const MARGIN: f32 = 0.95; // of the slot the model's extent fills
 const HALO_RADIUS: f32 = 0.05; // of the buffer's smaller side
@@ -178,6 +181,29 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
         return out;
     }
     let (sw, sh) = (w * SS, h * SS);
+    // the model's size in camera space, for the glow's depth tolerance
+    let (mut plo, mut phi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in tris
+        .iter()
+        .flat_map(|t| t.p)
+        .filter(|v| v.iter().all(|c| c.is_finite()))
+    {
+        for k in 0..3 {
+            plo[k] = plo[k].min(v[k]);
+            phi[k] = phi[k].max(v[k]);
+        }
+    }
+    let glow_tolerance = GLOW_DEPTH_TOLERANCE * (0..3).map(|k| phi[k] - plo[k]).fold(0.0, f32::max);
+    // whether depth q is in front of what is drawn: q is 1/distance under perspective, z (toward the camera) otherwise
+    let in_front = |q: f32, drawn: f32, glow: bool| {
+        if !glow || drawn == f32::NEG_INFINITY {
+            q > drawn
+        } else if persp {
+            1.0 / q < 1.0 / drawn + glow_tolerance
+        } else {
+            q > drawn - glow_tolerance
+        }
+    };
     let scale = MARGIN * (sw as f32 / ex.max(1e-9)).min(sh as f32 / ey.max(1e-9));
     let (cx, cy) = ((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0);
     let to_samples = |q: [f32; 3]| {
@@ -260,7 +286,7 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
                 // q interpolates linearly on screen (1/distance under perspective): it is the depth test
                 let z = w0 * a[2] + w1 * b[2] + w2 * d[2];
                 let i = y * sw + x;
-                if z <= depth[i] {
+                if !in_front(z, depth[i], t.glow) {
                     continue;
                 }
                 // a ForceField's ripple: a fine, faint speckle drifting with time (as the game's: no broad bands)
@@ -552,6 +578,22 @@ mod tests {
         let [_, _, _, a] = px(&alone, 40, 20, 22);
         assert!(a > 60 && a < 120, "{a}");
         assert!(premultiplied(&alone));
+    }
+
+    #[test]
+    fn glow_shows_through_a_hair_thin_cover() {
+        // a glowing triangle 2% of the model's size behind a solid one still shows; 20% behind it doesn't
+        let cover = tri([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], 0x404040, false);
+        let rune = |depth: f32| {
+            tri(
+                [[-0.3, -0.3, -depth], [0.3, -0.3, -depth], [0.0, 0.3, -depth]],
+                0x00ff00,
+                true,
+            )
+        };
+        let green = |depth| px(&r(&[cover, rune(depth)], 40, 40), 40, 20, 20)[1];
+        assert!(green(0.04) > 200, "{}", green(0.04));
+        assert!(green(0.4) < 100, "{}", green(0.4));
     }
 
     #[test]

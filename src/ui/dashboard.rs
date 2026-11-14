@@ -390,6 +390,7 @@ type Slot<F> = RefCell<Option<Rc<F>>>;
 // The title bar is the top CAPTION_DIP of the client area (WM_NCCALCSIZE drops the system one); dragging it moves
 // the window (WM_NCHITTEST says HTCAPTION), and its two buttons are drawn and clicked here.
 const CAPTION_DIP: i32 = 32;
+const HEADER_NOTE_DIP: i32 = 190; // set_header_note's column: two short "name value · name value" lines
 const CAPTION_BUTTON_DIP: i32 = 46;
 const MINIMIZE: i32 = 0;
 const CLOSE: i32 = 1;
@@ -445,6 +446,7 @@ pub struct Dashboard<'a> {
     tone: Cell<Tone>,
     status_title: RefCell<String>,
     status_detail: RefCell<String>,
+    header_note: RefCell<String>, // set_header_note
     status_tip: RefCell<String>,
     header_rect: Cell<RECT>,         // client rect, for the status tooltip
     width: Cell<i32>,                // client width
@@ -576,6 +578,7 @@ impl<'a> Dashboard<'a> {
             tone: Cell::new(Tone::Neutral),
             status_title: RefCell::new(String::new()),
             status_detail: RefCell::new(String::new()),
+            header_note: RefCell::new(String::new()),
             status_tip: RefCell::new(String::new()),
             header_rect: Cell::new(RECT::default()),
             width: Cell::new(0),
@@ -1105,13 +1108,36 @@ impl<'a> Dashboard<'a> {
         send(tip, TTM_UPDATETIPTEXTW, 0, &raw const ti as isize);
     }
 
+    /// A small muted note at the header's right, up to three lines ('\n'), beside the status (e.g. what the app costs
+    /// the machine). Repaints only on change; "" removes it.
+    pub fn set_header_note(&self, note: &str) {
+        if *self.header_note.borrow() == note {
+            return;
+        }
+        let gap_changed = self.header_gap() != (!note.is_empty() || !self.status_detail.borrow().is_empty());
+        note.clone_into(&mut self.header_note.borrow_mut());
+        let header = self.header.get();
+        if header.is_invalid() {
+            return;
+        }
+        if gap_changed {
+            self.layout(None);
+        }
+        let _ = unsafe { InvalidateRect(Some(header), None, false) };
+    }
+
+    /// Whether the header keeps room under its title: for the detail lines or the note.
+    fn header_gap(&self) -> bool {
+        !self.status_detail.borrow().is_empty() || !self.header_note.borrow().is_empty()
+    }
+
     /// Header: colored dot + title, detail on up to two muted lines below (empty: no room kept for it). Repaints only
     /// on change. Technical details belong in set_status_tip.
     pub fn set_status(&self, tone: Tone, title: &str, detail: &str) {
         if tone == self.tone.get() && *self.status_title.borrow() == title && *self.status_detail.borrow() == detail {
             return;
         }
-        let gap_changed = self.status_detail.borrow().is_empty() != detail.is_empty();
+        let gap_changed = self.header_gap() != (!detail.is_empty() || !self.header_note.borrow().is_empty());
         self.tone.set(tone);
         title.clone_into(&mut self.status_title.borrow_mut());
         detail.clone_into(&mut self.status_detail.borrow_mut());
@@ -1704,11 +1730,7 @@ impl<'a> Dashboard<'a> {
             let line_h = tm.tmHeight;
             let text_dy = (row_h - line_h) / 2;
 
-            let detail_h = if self.status_detail.borrow().is_empty() {
-                0
-            } else {
-                px(2) + 2 * line_h
-            };
+            let detail_h = if self.header_gap() { px(2) + 2 * line_h } else { 0 };
             let header_h = big_h + detail_h;
             let header_top = px(CAPTION_DIP) + m; // under the title bar
             let _ = MoveWindow(self.header.get(), m, header_top, card_w, header_h, false);
@@ -2178,6 +2200,13 @@ impl<'a> Dashboard<'a> {
         let big_line_h = self.big_line_h.get();
         let title = self.status_title.borrow().clone();
         let detail = self.status_detail.borrow().clone();
+        let note = self.header_note.borrow().clone();
+        // the note keeps a column at the right; the status takes the rest
+        let note_w = if note.is_empty() { 0 } else { self.px(HEADER_NOTE_DIP) };
+        let rc_status = RECT {
+            right: rc.right - note_w,
+            ..rc
+        };
         let mut canvas = self.canvas.try_borrow_mut().ok();
         let began = canvas.as_mut().is_some_and(|c| c.begin(di.hDC, &rc, None));
         let Some(canvas) = canvas.as_mut().filter(|_| began) else {
@@ -2192,7 +2221,7 @@ impl<'a> Dashboard<'a> {
                 let mut t = RECT {
                     left,
                     top: rc.top,
-                    right: rc.right,
+                    right: rc_status.right,
                     bottom: rc.top + big_line_h,
                 };
                 let mut s: Vec<u16> = title.encode_utf16().collect();
@@ -2202,7 +2231,7 @@ impl<'a> Dashboard<'a> {
                 let mut t = RECT {
                     left,
                     top: t.bottom + self.px(2),
-                    right: rc.right,
+                    right: rc_status.right,
                     bottom: rc.bottom,
                 };
                 let mut s: Vec<u16> = detail.encode_utf16().collect();
@@ -2230,14 +2259,21 @@ impl<'a> Dashboard<'a> {
         let r = D2D_RECT_F {
             left: left as f32,
             top: rc.top as f32,
-            right: rc.right as f32,
+            right: rc_status.right as f32,
             bottom: title_bottom,
         };
         canvas.text(&title, big.as_ref(), &r, theme.text, Align::Left, false);
         let r = D2D_RECT_F {
+            left: (rc.right - note_w) as f32,
+            top: rc.top as f32 + self.px(3) as f32,
+            right: rc.right as f32,
+            bottom: rc.bottom as f32,
+        };
+        canvas.text(&note, body.as_ref(), &r, theme.text2, Align::Right, true);
+        let r = D2D_RECT_F {
             left: left as f32,
             top: title_bottom + self.px(2) as f32,
-            right: rc.right as f32,
+            right: rc_status.right as f32,
             bottom: rc.bottom as f32,
         };
         canvas.text(&detail, body.as_ref(), &r, theme.text2, Align::Left, true);

@@ -6,3 +6,4 @@ pub mod spsc_queue;
 pub mod text;
 pub mod thread;
 pub mod timing;
+pub mod usage;

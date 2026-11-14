@@ -34,7 +34,7 @@ pub struct Texture {
 
 impl Texture {
     /// Bilinear, wrapping; [r, g, b, a] 0..1. An empty texture (one still loading) is clear, so the color shows.
-    fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+    pub fn sample(&self, u: f32, v: f32) -> [f32; 4] {
         let (w, h) = (self.w as usize, self.h as usize);
         if w == 0 || h == 0 || self.rgba.len() < w * h * 4 || !u.is_finite() || !v.is_finite() {
             return [0.0; 4];

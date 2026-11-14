@@ -390,6 +390,7 @@ type Slot<F> = RefCell<Option<Rc<F>>>;
 // The title bar is the top CAPTION_DIP of the client area (WM_NCCALCSIZE drops the system one); dragging it moves
 // the window (WM_NCHITTEST says HTCAPTION), and its two buttons are drawn and clicked here.
 const CAPTION_DIP: i32 = 32;
+const HEADER_NOTE_DIP: i32 = 110; // set_header_note's column: short "name value" lines, e.g. "RAM 58 MB"
 const CAPTION_BUTTON_DIP: i32 = 46;
 const MINIMIZE: i32 = 0;
 const CLOSE: i32 = 1;
@@ -426,7 +427,6 @@ pub struct Dashboard<'a> {
     cap_hot: Cell<i32>,    // caption button under the mouse / pressed; -1 = none
     cap_down: Cell<i32>,
     badge: RefCell<(String, Tone, String)>, // text, dot, hover tip
-    title_note: RefCell<String>,            // set_title_note
     tooltip: Cell<HWND>,
     tip_rect: Cell<RECT>, // the badge rect the tooltip's tool has
     // Drawing: Direct2D and DirectWrite on the canvas; the Win32 controls (labels, fields, trees) draw themselves with
@@ -446,6 +446,7 @@ pub struct Dashboard<'a> {
     tone: Cell<Tone>,
     status_title: RefCell<String>,
     status_detail: RefCell<String>,
+    header_note: RefCell<String>, // set_header_note
     status_tip: RefCell<String>,
     header_rect: Cell<RECT>,         // client rect, for the status tooltip
     width: Cell<i32>,                // client width
@@ -560,7 +561,6 @@ impl<'a> Dashboard<'a> {
             cap_hot: Cell::new(-1),
             cap_down: Cell::new(-1),
             badge,
-            title_note: RefCell::new(String::new()),
             tooltip: Cell::new(HWND::default()),
             tip_rect: Cell::new(RECT::default()),
             canvas: RefCell::new(Canvas::default()),
@@ -578,6 +578,7 @@ impl<'a> Dashboard<'a> {
             tone: Cell::new(Tone::Neutral),
             status_title: RefCell::new(String::new()),
             status_detail: RefCell::new(String::new()),
+            header_note: RefCell::new(String::new()),
             status_tip: RefCell::new(String::new()),
             header_rect: Cell::new(RECT::default()),
             width: Cell::new(0),
@@ -994,16 +995,6 @@ impl<'a> Dashboard<'a> {
         self.trees.borrow_mut().insert(id, st);
     }
 
-    /// One muted line in the title bar after the title and badge (e.g. what the app costs the machine), cut at the
-    /// minimize button; "" removes it. Repaints only on change.
-    pub fn set_title_note(&self, note: &str) {
-        if *self.title_note.borrow() == note {
-            return;
-        }
-        note.clone_into(&mut self.title_note.borrow_mut());
-        self.invalidate_caption();
-    }
-
     /// The colors the window draws with now: they follow Windows' light or dark setting, so read them each tick.
     pub fn theme(&self) -> Theme {
         self.theme.get()
@@ -1122,13 +1113,36 @@ impl<'a> Dashboard<'a> {
         send(tip, TTM_UPDATETIPTEXTW, 0, &raw const ti as isize);
     }
 
+    /// A small muted note at the header's right, up to three lines ('\n'), beside the status (e.g. what the app costs
+    /// the machine). Repaints only on change; "" removes it.
+    pub fn set_header_note(&self, note: &str) {
+        if *self.header_note.borrow() == note {
+            return;
+        }
+        let gap_changed = self.header_gap() != (!note.is_empty() || !self.status_detail.borrow().is_empty());
+        note.clone_into(&mut self.header_note.borrow_mut());
+        let header = self.header.get();
+        if header.is_invalid() {
+            return;
+        }
+        if gap_changed {
+            self.layout(None);
+        }
+        let _ = unsafe { InvalidateRect(Some(header), None, false) };
+    }
+
+    /// Whether the header keeps room under its title: for the detail lines or the note.
+    fn header_gap(&self) -> bool {
+        !self.status_detail.borrow().is_empty() || !self.header_note.borrow().is_empty()
+    }
+
     /// Header: colored dot + title, detail on up to two muted lines below (empty: no room kept for it). Repaints only
     /// on change. Technical details belong in set_status_tip.
     pub fn set_status(&self, tone: Tone, title: &str, detail: &str) {
         if tone == self.tone.get() && *self.status_title.borrow() == title && *self.status_detail.borrow() == detail {
             return;
         }
-        let gap_changed = self.status_detail.borrow().is_empty() != detail.is_empty();
+        let gap_changed = self.header_gap() != (!detail.is_empty() || !self.header_note.borrow().is_empty());
         self.tone.set(tone);
         title.clone_into(&mut self.status_title.borrow_mut());
         detail.clone_into(&mut self.status_detail.borrow_mut());
@@ -1343,19 +1357,7 @@ impl<'a> Dashboard<'a> {
             bottom: cap as f32,
         };
         canvas.text(&title, self.text_format(0).as_ref(), &r, ink, Align::Left, false);
-        let badge_rects = self.badge_rects(r.left as i32, cap, &title);
-        let note = self.title_note.borrow().clone();
-        if !note.is_empty() {
-            let after = badge_rects.map_or(r.left as i32 + self.text_width(&title), |(pill, _)| pill.right);
-            let n = D2D_RECT_F {
-                left: (after + self.px(12)) as f32,
-                ..r
-            };
-            if n.left < n.right {
-                canvas.text(&note, self.text_format(0).as_ref(), &n, theme.text2, Align::Left, false);
-            }
-        }
-        if let Some((pill, text)) = badge_rects {
+        if let Some((pill, text)) = self.badge_rects(r.left as i32, cap, &title) {
             let (badge, tone, _) = self.badge.borrow().clone();
             let hot = self.cap_hot.get() == BADGE && self.on_badge_click.borrow().is_some();
             let fill = blend(theme.text, theme.bg, if hot { 0.16 } else { 0.1 });
@@ -1733,11 +1735,7 @@ impl<'a> Dashboard<'a> {
             let line_h = tm.tmHeight;
             let text_dy = (row_h - line_h) / 2;
 
-            let detail_h = if self.status_detail.borrow().is_empty() {
-                0
-            } else {
-                px(2) + 2 * line_h
-            };
+            let detail_h = if self.header_gap() { px(2) + 2 * line_h } else { 0 };
             let header_h = big_h + detail_h;
             let header_top = px(CAPTION_DIP) + m; // under the title bar
             let _ = MoveWindow(self.header.get(), m, header_top, card_w, header_h, false);
@@ -2207,6 +2205,13 @@ impl<'a> Dashboard<'a> {
         let big_line_h = self.big_line_h.get();
         let title = self.status_title.borrow().clone();
         let detail = self.status_detail.borrow().clone();
+        let note = self.header_note.borrow().clone();
+        // the note keeps a column at the right; the status takes the rest
+        let note_w = if note.is_empty() { 0 } else { self.px(HEADER_NOTE_DIP) };
+        let rc_status = RECT {
+            right: rc.right - note_w,
+            ..rc
+        };
         let mut canvas = self.canvas.try_borrow_mut().ok();
         let began = canvas.as_mut().is_some_and(|c| c.begin(di.hDC, &rc, None));
         let Some(canvas) = canvas.as_mut().filter(|_| began) else {
@@ -2221,7 +2226,7 @@ impl<'a> Dashboard<'a> {
                 let mut t = RECT {
                     left,
                     top: rc.top,
-                    right: rc.right,
+                    right: rc_status.right,
                     bottom: rc.top + big_line_h,
                 };
                 let mut s: Vec<u16> = title.encode_utf16().collect();
@@ -2231,7 +2236,7 @@ impl<'a> Dashboard<'a> {
                 let mut t = RECT {
                     left,
                     top: t.bottom + self.px(2),
-                    right: rc.right,
+                    right: rc_status.right,
                     bottom: rc.bottom,
                 };
                 let mut s: Vec<u16> = detail.encode_utf16().collect();
@@ -2259,14 +2264,21 @@ impl<'a> Dashboard<'a> {
         let r = D2D_RECT_F {
             left: left as f32,
             top: rc.top as f32,
-            right: rc.right as f32,
+            right: rc_status.right as f32,
             bottom: title_bottom,
         };
         canvas.text(&title, big.as_ref(), &r, theme.text, Align::Left, false);
         let r = D2D_RECT_F {
+            left: (rc.right - note_w) as f32,
+            top: rc.top as f32 + self.px(3) as f32,
+            right: rc.right as f32,
+            bottom: rc.bottom as f32,
+        };
+        canvas.text(&note, body.as_ref(), &r, theme.text2, Align::Right, true);
+        let r = D2D_RECT_F {
             left: left as f32,
             top: title_bottom + self.px(2) as f32,
-            right: rc.right as f32,
+            right: rc_status.right as f32,
             bottom: rc.bottom as f32,
         };
         canvas.text(&detail, body.as_ref(), &r, theme.text2, Align::Left, true);

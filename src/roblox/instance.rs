@@ -30,7 +30,7 @@ fn child_bounds(m: &dyn Memory, o: &Offsets, inst: usize) -> Option<(usize, usiz
 
 /// An MSVC std::string of at most 4096 bytes: a 16-byte inline buffer (or the heap pointer) at 0, size and
 /// capacity at Misc.StringLength.
-pub(crate) fn read_string(m: &dyn Memory, o: &Offsets, s: usize) -> Option<String> {
+pub fn read_string(m: &dyn Memory, o: &Offsets, s: usize) -> Option<String> {
     let len_at = o["Misc.StringLength"];
     let mut head = [0u8; 64];
     let whole = (16..=48).contains(&len_at) && m.read(s, &mut head[..len_at as usize + 16]);

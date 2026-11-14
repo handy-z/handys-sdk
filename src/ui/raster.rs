@@ -1,25 +1,88 @@
-//! A small CPU rasterizer for turning 3D models in a dashboard picture slot: a few thousand triangles into a slot of
-//! about 100x60 pixels every tick costs well under a millisecond, which keeps Direct3D out of the dashboard.
+//! A small CPU rasterizer for drawing 3D models into a dashboard picture slot: a few thousand triangles into a slot of
+//! about 200x100 pixels costs a few milliseconds, which keeps Direct3D out of the dashboard.
 
-/// One triangle: corners in model space (Y up), per-corner normals in model space (an all-zero or non-finite one uses
-/// the face normal, so `[[0.0; 3]; 3]` draws it flat), color 0xRRGGBB, `glow` drawn mostly unlit, brightened and with a
-/// soft halo (like Roblox Neon).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One triangle: corners in camera space (x right, y up, the camera at the origin looking down -z), per-corner normals
+/// in the same space (an all-zero or non-finite one uses the face normal, so `[[0.0; 3]; 3]` draws it flat), color
+/// 0xRRGGBB, `glow` drawn mostly unlit, brightened and with a soft halo (like Roblox Neon). `tex` is 1 + an index into
+/// render's textures (0 for none), sampled at the corners' `uv` (0..1, v down) and laid over the color by its alpha.
+/// `see_through` ones (like Roblox ForceField) are drawn after the solid ones, faintly over what is behind them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Tri {
     pub p: [[f32; 3]; 3],
     pub n: [[f32; 3]; 3],
     pub rgb: u32,
     pub glow: bool,
+    pub uv: [[f32; 2]; 3],
+    pub tex: u32,
+    pub see_through: bool,
+}
+
+/// A straight-alpha RGBA image, row-major.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Texture {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl Texture {
+    /// Bilinear, wrapping; [r, g, b, a] 0..1. An empty texture (one still loading) is clear, so the color shows.
+    fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        let (w, h) = (self.w as usize, self.h as usize);
+        if w == 0 || h == 0 || self.rgba.len() < w * h * 4 || !u.is_finite() || !v.is_finite() {
+            return [0.0; 4];
+        }
+        let (x, y) = (u.rem_euclid(1.0) * w as f32 - 0.5, v.rem_euclid(1.0) * h as f32 - 0.5);
+        let (fx, fy) = (x - x.floor(), y - y.floor());
+        let (x0, y0) = (x.floor() as isize, y.floor() as isize);
+        let at = |dx: isize, dy: isize| {
+            let (xi, yi) = (
+                (x0 + dx).rem_euclid(w as isize) as usize,
+                (y0 + dy).rem_euclid(h as isize) as usize,
+            );
+            let o = (yi * w + xi) * 4;
+            [0, 1, 2, 3].map(|k| f32::from(self.rgba[o + k]) / 255.0)
+        };
+        let (a, b, c, d) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
+        [0, 1, 2, 3].map(|k| {
+            let top = a[k] + (b[k] - a[k]) * fx;
+            let bottom = c[k] + (d[k] - c[k]) * fx;
+            top + (bottom - top) * fy
+        })
+    }
+}
+
+/// How the triangles are seen: a perspective camera with this vertical field of view (radians; 0 for orthographic),
+/// and Roblox-style light: `ambient` plus `color` times the diffuse term of a light shining along `dir` (camera
+/// space), each channel 0..1 and the sum clamped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scene {
+    pub fov: f32,
+    pub ambient: [f32; 3],
+    pub color: [f32; 3],
+    pub dir: [f32; 3],
+}
+
+impl Default for Scene {
+    /// A ViewportFrame's defaults: Ambient (200, 200, 200), LightColor (140, 140, 140), LightDirection (-1, -1, -1),
+    /// seen orthographically.
+    fn default() -> Self {
+        Self {
+            fov: 0.0,
+            ambient: [200.0 / 255.0; 3],
+            color: [140.0 / 255.0; 3],
+            dir: [-1.0, -1.0, -1.0],
+        }
+    }
 }
 
 const SS: usize = 3; // samples per pixel along each axis, box-filtered down for smooth edges
-const PITCH: f32 = 0.4; // radians the camera looks down from
-const AMBIENT: f32 = 0.3;
 const GLOW_AMBIENT: f32 = 0.7; // Neon: mostly its own light, a little shape kept so it doesn't read as a flat silhouette
-const MARGIN: f32 = 0.95; // of the half-size the bounding sphere fills
+const MARGIN: f32 = 0.95; // of the slot the model's extent fills
 const HALO_RADIUS: f32 = 0.05; // of the buffer's smaller side
 const HALO: f32 = 1.2; // the blur is about half the color at a silhouette, so the halo starts at ~0.6 of it
 const GLOW_BIT: u32 = 1 << 24; // marks a sample's packed color as a glow surface
+const SEE_THROUGH: f32 = 0.35; // opacity of a see_through surface
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
@@ -57,80 +120,97 @@ fn box_blur(img: &mut [[f32; 3]], w: usize, h: usize, r: usize) {
 }
 
 /// The triangles drawn into a w x h premultiplied BGRA buffer (row-major, 4*w bytes per row), transparent background:
-/// turned `yaw` radians about the vertical (Y, up) axis around the model's bounding-box center, seen from a fixed
-/// slight elevation, fitted to the buffer by its bounding sphere (so its size stays fixed while it turns).
-pub fn render(tris: &[Tri], w: u32, h: u32, yaw: f32) -> Vec<u8> {
+/// projected by `scene`'s camera, then scaled and centered so the model's projected extent fills the buffer. Each
+/// surface is lit on the side facing the camera (meshes come wound either way).
+pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![0u8; w * h * 4];
-    let finite = |t: &&Tri| t.p.iter().flatten().all(|v| v.is_finite());
-    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-    for v in tris.iter().filter(finite).flat_map(|t| t.p) {
-        for k in 0..3 {
-            lo[k] = lo[k].min(v[k]);
-            hi[k] = hi[k].max(v[k]);
+    let persp = scene.fov > 1e-3 && scene.fov < 3.0;
+    let focal = if persp { 1.0 / (scene.fov / 2.0).tan() } else { 1.0 };
+    // x, y on the image plane (y up) and q, larger nearer: 1/distance for perspective, z for orthographic
+    let project = |v: [f32; 3]| -> Option<[f32; 3]> {
+        if !v.iter().all(|c| c.is_finite()) {
+            return None;
+        }
+        if !persp {
+            return Some(v);
+        }
+        let d = -v[2];
+        (d > 1e-4).then(|| [v[0] * focal / d, v[1] * focal / d, 1.0 / d])
+    };
+    let projected: Vec<Option<[[f32; 3]; 3]>> = tris
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.p.map(project);
+            Some([a?, b?, c?])
+        })
+        .collect();
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for q in projected.iter().flatten().flatten() {
+        for k in 0..2 {
+            lo[k] = lo[k].min(q[k]);
+            hi[k] = hi[k].max(q[k]);
         }
     }
-    let c = [0, 1, 2].map(|k| (lo[k] + hi[k]) / 2.0);
-    let radius = tris
-        .iter()
-        .filter(finite)
-        .flat_map(|t| t.p)
-        .map(|v| ((v[0] - c[0]).powi(2) + (v[1] - c[1]).powi(2) + (v[2] - c[2]).powi(2)).sqrt())
-        .fold(0.0f32, f32::max);
-    if w == 0 || h == 0 || radius <= 0.0 || !radius.is_finite() {
+    let (ex, ey) = (hi[0] - lo[0], hi[1] - lo[1]);
+    if w == 0 || h == 0 || !(ex > 0.0 || ey > 0.0) || !ex.is_finite() || !ey.is_finite() {
         return out;
     }
     let (sw, sh) = (w * SS, h * SS);
-    let scale = sw.min(sh) as f32 / 2.0 * MARGIN / radius;
-    let (ys, yc) = yaw.sin_cos();
-    let (ps, pc) = PITCH.sin_cos();
-    // model to view space: x right, y up, z toward the camera
-    let turn = |v: [f32; 3]| {
-        let (x, z) = (v[0] * yc + v[2] * ys, -v[0] * ys + v[2] * yc);
-        [x, v[1] * pc - z * ps, v[1] * ps + z * pc]
+    let scale = MARGIN * (sw as f32 / ex.max(1e-9)).min(sh as f32 / ey.max(1e-9));
+    let (cx, cy) = ((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0);
+    let to_samples = |q: [f32; 3]| {
+        [
+            sw as f32 / 2.0 + (q[0] - cx) * scale,
+            sh as f32 / 2.0 - (q[1] - cy) * scale,
+            q[2],
+        ]
     };
-    // then x, y to samples (y down); z scaled alike so the face normal below comes out undistorted
-    let view = |v: [f32; 3]| {
-        let [x, y, z] = turn([v[0] - c[0], v[1] - c[1], v[2] - c[2]]);
-        [sw as f32 / 2.0 + x * scale, sh as f32 / 2.0 - y * scale, z * scale]
-    };
-    // upper left and partly toward the camera: a light along the view lit every face alike, one from the side left
-    // camera-facing faces dim
-    let light = unit([-0.6, 0.6, 0.8]).unwrap_or_default();
+    let toward_light = unit(scene.dir.map(|v| -v)).unwrap_or([0.0, 0.0, 1.0]);
     let mut depth = vec![f32::NEG_INFINITY; sw * sh];
     let mut color = vec![0u32; sw * sh];
+    let mut cover = vec![0u8; sw * sh]; // 255 under a solid surface, less under see-through ones only
     let mut any_glow = false;
-    for t in tris.iter().filter(finite) {
-        let [a, b, d] = t.p.map(view);
+    // solid first: a see-through surface blends over whatever is behind it, so that must be drawn already
+    let order = (0..tris.len())
+        .filter(|&i| !tris[i].see_through)
+        .chain((0..tris.len()).filter(|&i| tris[i].see_through));
+    for (t, q) in order.map(|i| (&tris[i], &projected[i])) {
+        let Some(q) = q else { continue };
+        let [a, b, d] = q.map(to_samples);
         let area = (b[0] - a[0]) * (d[1] - a[1]) - (b[1] - a[1]) * (d[0] - a[0]);
         if area.abs() < 1e-6 {
             continue; // degenerate, or edge-on
         }
         any_glow |= t.glow;
-        let corners = t.n.map(|n| unit(n).map(turn));
-        let face = {
-            // in view space with y up (undo the sample flip)
-            let (u, v) = (
-                [b[0] - a[0], a[1] - b[1], b[2] - a[2]],
-                [d[0] - a[0], a[1] - d[1], d[2] - a[2]],
-            );
-            let n = unit([
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ])
-            .unwrap_or_default();
-            // the winding is arbitrary: face the way the given corner normals do, so blending with them can't cancel
-            let given = corners
-                .iter()
-                .flatten()
-                .fold([0.0; 3], |s, c| [s[0] + c[0], s[1] + c[1], s[2] + c[2]]);
-            if dot(n, given) < 0.0 { n.map(|v| -v) } else { n }
+        // the face normal turned toward the camera: the side we see is the side that is lit
+        let (u, v) = (
+            [0, 1, 2].map(|k| t.p[1][k] - t.p[0][k]),
+            [0, 1, 2].map(|k| t.p[2][k] - t.p[0][k]),
+        );
+        let face = unit([
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ])
+        .unwrap_or([0.0, 0.0, 1.0]);
+        let eye = if persp {
+            let c = [0, 1, 2].map(|k| -(t.p[0][k] + t.p[1][k] + t.p[2][k]) / 3.0);
+            unit(c).unwrap_or([0.0, 0.0, 1.0])
+        } else {
+            [0.0, 0.0, 1.0]
         };
-        let [n0, n1, n2] = corners.map(|c| c.unwrap_or(face));
-        let ambient = if t.glow { GLOW_AMBIENT } else { AMBIENT };
-        let base = [16, 8, 0].map(|s| ((t.rgb >> s) & 0xff) as f32);
+        let face = if dot(face, eye) < 0.0 { face.map(|c| -c) } else { face };
+        // given normals point outward; on a surface seen from inside (a thin fin's back) they face away: flip them
+        let [n0, n1, n2] = t.n.map(|n| match unit(n) {
+            Some(n) if dot(n, face) < 0.0 => n.map(|c| -c),
+            Some(n) => n,
+            None => face,
+        });
+        let tex = textures.get((t.tex as usize).wrapping_sub(1));
+        let base = [16, 8, 0].map(|s| ((t.rgb >> s) & 0xff) as f32 / 255.0);
         let flag = if t.glow { GLOW_BIT } else { 0 };
+        let qs = if persp { [a[2], b[2], d[2]] } else { [1.0; 3] };
         let x0 = a[0].min(b[0]).min(d[0]).floor().max(0.0) as usize;
         let x1 = (a[0].max(b[0]).max(d[0]).ceil().max(0.0) as usize).min(sw);
         let y0 = a[1].min(b[1]).min(d[1]).floor().max(0.0) as usize;
@@ -146,23 +226,54 @@ pub fn render(tris: &[Tri], w: u32, h: u32, yaw: f32) -> Vec<u8> {
                 if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                     continue;
                 }
+                // q interpolates linearly on screen (1/distance under perspective): it is the depth test
                 let z = w0 * a[2] + w1 * b[2] + w2 * d[2];
                 let i = y * sw + x;
                 if z <= depth[i] {
                     continue;
                 }
-                depth[i] = z;
-                let n = [0, 1, 2].map(|k| w0 * n0[k] + w1 * n1[k] + w2 * n2[k]);
-                // |n.l| so either winding is lit
-                let lit = (dot(n, light) / dot(n, n).sqrt()).abs();
-                let shade = ambient + (1.0 - ambient) * if lit.is_finite() { lit.min(1.0) } else { 0.0 };
-                let rgb = base.map(|ch| {
-                    let v = ch * shade;
-                    (if t.glow { v + (255.0 - v) * 0.3 } else { v })
-                        .round()
-                        .clamp(0.0, 255.0) as u32
+                if !t.see_through {
+                    depth[i] = z;
+                }
+                // perspective-correct weights for the attributes
+                let pw = [w0 * qs[0], w1 * qs[1], w2 * qs[2]];
+                let sum = pw[0] + pw[1] + pw[2];
+                let pw = pw.map(|v| v / sum);
+                let n = [0, 1, 2].map(|k| pw[0] * n0[k] + pw[1] * n1[k] + pw[2] * n2[k]);
+                let diffuse = (dot(n, toward_light) / dot(n, n).sqrt()).max(0.0);
+                let diffuse = if diffuse.is_finite() { diffuse.min(1.0) } else { 0.0 };
+                let albedo = match tex {
+                    Some(tex) => {
+                        let uv = [0, 1].map(|k| pw[0] * t.uv[0][k] + pw[1] * t.uv[1][k] + pw[2] * t.uv[2][k]);
+                        let s = tex.sample(uv[0], uv[1]);
+                        [0, 1, 2].map(|k| base[k] + (s[k] - base[k]) * s[3])
+                    }
+                    None => base,
+                };
+                let rgb = [0, 1, 2].map(|k| {
+                    let v = if t.glow {
+                        let v = albedo[k] * (GLOW_AMBIENT + (1.0 - GLOW_AMBIENT) * diffuse);
+                        v + (1.0 - v) * 0.3
+                    } else {
+                        albedo[k] * (scene.ambient[k] + scene.color[k] * diffuse)
+                    };
+                    (v * 255.0).round().clamp(0.0, 255.0) as u32
                 });
-                color[i] = flag | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+                let packed = flag | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+                if !t.see_through {
+                    color[i] = packed;
+                    cover[i] = 255;
+                } else if cover[i] == 0 {
+                    color[i] = packed;
+                    cover[i] = (SEE_THROUGH * 255.0) as u8;
+                } else {
+                    let mix = |s: u32| {
+                        let (a, b) = (((color[i] >> s) & 0xff) as f32, ((packed >> s) & 0xff) as f32);
+                        ((a + (b - a) * SEE_THROUGH).round() as u32) << s
+                    };
+                    color[i] = (color[i] & GLOW_BIT) | flag | mix(16) | mix(8) | mix(0);
+                    cover[i] += (f32::from(255 - cover[i]) * SEE_THROUGH) as u8;
+                }
             }
         }
     }
@@ -170,13 +281,15 @@ pub fn render(tris: &[Tri], w: u32, h: u32, yaw: f32) -> Vec<u8> {
     let mut glow = vec![[0.0f32; 3]; if any_glow { w * h } else { 0 }];
     for y in 0..h {
         for x in 0..w {
-            let (mut sum, mut lit, mut hits) = ([0u32; 3], [0u32; 3], 0u32);
+            let (mut sum, mut lit, mut hits) = ([0u32; 3], [0u32; 3], 0u32); // hits: summed cover, 255 a sample
             for sy in 0..SS {
                 for sx in 0..SS {
                     let i = (y * SS + sy) * sw + x * SS + sx;
-                    if depth[i] > f32::NEG_INFINITY {
-                        hits += 1;
-                        let ch = [color[i] & 0xff, (color[i] >> 8) & 0xff, (color[i] >> 16) & 0xff];
+                    if cover[i] > 0 {
+                        let c = u32::from(cover[i]);
+                        hits += c;
+                        let ch =
+                            [color[i] & 0xff, (color[i] >> 8) & 0xff, (color[i] >> 16) & 0xff].map(|v| v * c / 255);
                         (0..3).for_each(|k| sum[k] += ch[k]);
                         if color[i] & GLOW_BIT != 0 {
                             (0..3).for_each(|k| lit[k] += ch[k]);
@@ -186,7 +299,7 @@ pub fn render(tris: &[Tri], w: u32, h: u32, yaw: f32) -> Vec<u8> {
             }
             // uncovered samples count as transparent black: the averages are already premultiplied
             let o = (y * w + x) * 4;
-            out[o..o + 4].copy_from_slice(&[sum[0] / n, sum[1] / n, sum[2] / n, hits * 255 / n].map(|v| v as u8));
+            out[o..o + 4].copy_from_slice(&[sum[0] / n, sum[1] / n, sum[2] / n, hits / n].map(|v| v as u8));
             if any_glow {
                 glow[y * w + x] = lit.map(|v| v as f32 / n as f32);
             }
@@ -218,14 +331,18 @@ mod tests {
     fn tri(p: [[f32; 3]; 3], rgb: u32, glow: bool) -> Tri {
         Tri {
             p,
-            n: [[0.0; 3]; 3],
             rgb,
             glow,
+            ..Tri::default()
         }
     }
 
     fn big(glow: bool) -> Tri {
         tri([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], 0xff8000, glow)
+    }
+
+    fn r(tris: &[Tri], w: u32, h: u32) -> Vec<u8> {
+        render(tris, &[], &Scene::default(), w, h)
     }
 
     fn px(buf: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
@@ -263,7 +380,7 @@ mod tests {
 
     #[test]
     fn big_triangle_fills_the_center_not_the_corner() {
-        let b = render(&[big(false)], 40, 40, 0.0);
+        let b = r(&[big(false)], 40, 40);
         assert_eq!(b.len(), 40 * 40 * 4);
         let [bl, g, r, a] = px(&b, 40, 20, 20);
         assert_eq!(a, 255);
@@ -276,8 +393,8 @@ mod tests {
 
     #[test]
     fn nothing_to_draw_is_transparent() {
-        assert_eq!(render(&[], 12, 7, 0.0), vec![0; 12 * 7 * 4]);
-        assert!(render(&[big(false)], 0, 7, 0.0).is_empty());
+        assert_eq!(r(&[], 12, 7), vec![0; 12 * 7 * 4]);
+        assert!(r(&[big(false)], 0, 7).is_empty());
         let junk = [
             tri([[0.0; 3]; 3], 0xffffff, false),
             tri(
@@ -286,35 +403,108 @@ mod tests {
                 false,
             ),
         ];
-        assert_eq!(render(&junk, 12, 7, 0.0), vec![0; 12 * 7 * 4]);
+        assert_eq!(r(&junk, 12, 7), vec![0; 12 * 7 * 4]);
         // a NaN triangle beside a real one is skipped, the real one still drawn
-        assert!(
-            render(&[junk[1], big(false)], 12, 7, 0.0)
-                .chunks(4)
-                .any(|p| p[3] == 255)
-        );
+        assert!(r(&[junk[1], big(false)], 12, 7).chunks(4).any(|p| p[3] == 255));
     }
 
     #[test]
-    fn size_stays_while_turning() {
-        let model = boxed();
-        let opaque = |yaw| {
-            let b = render(&model, 120, 60, yaw);
-            // the bounding sphere keeps it off the edges at any angle
-            for x in 0..120 {
-                assert_eq!(px(&b, 120, x, 0)[3], 0);
-                assert_eq!(px(&b, 120, x, 59)[3], 0);
-            }
-            b.chunks(4).filter(|p| p[3] > 128).count() as f32
+    fn stays_inside_the_buffer() {
+        let b = r(&boxed(), 120, 60);
+        for x in 0..120 {
+            assert_eq!(px(&b, 120, x, 0)[3], 0);
+            assert_eq!(px(&b, 120, x, 59)[3], 0);
+        }
+        assert!(b.chunks(4).filter(|p| p[3] > 128).count() > 1000);
+    }
+
+    #[test]
+    fn perspective_makes_the_near_end_bigger() {
+        // a long flat strip running away from the camera: its near end spans more pixels than its far end
+        let strip = [
+            tri(
+                [[-1.0, 0.0, -2.0], [1.0, 0.0, -2.0], [1.0, 0.0, -12.0]],
+                0xffffff,
+                false,
+            ),
+            tri(
+                [[1.0, 0.0, -12.0], [-1.0, 0.0, -12.0], [-1.0, 0.0, -2.0]],
+                0xffffff,
+                false,
+            ),
+        ]
+        .map(|mut t| {
+            t.p = t.p.map(|v| [v[0], v[1] - 1.0 + (v[2] + 2.0) * -0.15, v[2]]); // tilted so it shows
+            t
+        });
+        let scene = Scene {
+            fov: 1.2,
+            ..Scene::default()
         };
-        let (a, b) = (opaque(0.0), opaque(1.0));
-        assert!(a > 200.0 && (0.7..1.4).contains(&(b / a)), "{a} {b}");
+        let b = render(&strip, &[], &scene, 60, 60);
+        let width = |y: u32| (0..60).filter(|&x| px(&b, 60, x, y)[3] > 128).count();
+        let rows: Vec<u32> = (0..60).filter(|&y| width(y) > 0).collect();
+        let (top, bottom) = (rows[1], rows[rows.len() - 2]);
+        assert!(width(bottom) > width(top) * 2, "{} {}", width(bottom), width(top));
+        // nothing behind the camera is drawn
+        let behind = tri([[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 1.0]], 0xffffff, false);
+        assert_eq!(render(&[behind], &[], &scene, 10, 10), vec![0; 400]);
+    }
+
+    #[test]
+    fn see_through_shows_what_is_behind() {
+        // a white see-through triangle in front of a blue solid one: bluish, lighter; alone: faint
+        let front = Tri {
+            see_through: true,
+            ..tri([[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 1.0]], 0xffffff, false)
+        };
+        let back = tri([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], 0x0000ff, false);
+        let both = r(&[front, back], 40, 40); // listed first, still drawn over
+        let [b, g, red, a] = px(&both, 40, 20, 22);
+        assert!(
+            a == 255 && b > 200 && red > 60 && red < 160 && g == red,
+            "{red} {g} {b} {a}"
+        );
+        let alone = r(&[front], 40, 40);
+        let [_, _, _, a] = px(&alone, 40, 20, 22);
+        assert!(a > 60 && a < 120, "{a}");
+        assert!(premultiplied(&alone));
+    }
+
+    #[test]
+    fn texture_lays_over_the_color_by_its_alpha() {
+        // left half opaque red, right half clear: the clear half shows the triangle's own blue
+        let mut rgba = Vec::new();
+        for _ in 0..4 {
+            rgba.extend([255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0]);
+        }
+        let tex = Texture { w: 4, h: 4, rgba };
+        let quad = [
+            (
+                [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+                [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            ),
+            (
+                [[1.0, 1.0, 0.0], [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]],
+                [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]],
+            ),
+        ]
+        .map(|(p, uv)| Tri {
+            uv,
+            tex: 1,
+            ..tri(p, 0x0000ff, false)
+        });
+        let b = render(&quad, &[tex], &Scene::default(), 40, 40);
+        let [bl, g, red, _] = px(&b, 40, 8, 20);
+        assert!(red > 200 && g < 20 && bl < 20, "{red} {g} {bl}");
+        let [bl, g, red, _] = px(&b, 40, 31, 20);
+        assert!(bl > 200 && g < 20 && red < 20, "{red} {g} {bl}");
     }
 
     #[test]
     fn glow_is_brighter_than_lit() {
         let sum = |t| {
-            px(&render(&[t], 20, 20, 0.0), 20, 10, 10)[..3]
+            px(&r(&[t], 20, 20), 20, 10, 10)[..3]
                 .iter()
                 .map(|&v| u32::from(v))
                 .sum::<u32>()
@@ -358,7 +548,7 @@ mod tests {
     fn smooth_normals_blend_across_edges() {
         // the biggest brightness step between two opaque neighbors
         let step = |model: &[Tri]| {
-            let b = render(model, 80, 80, 0.3);
+            let b = r(model, 80, 80);
             assert!(premultiplied(&b));
             let mut worst = 0;
             for y in 0..80 {
@@ -377,20 +567,20 @@ mod tests {
 
     #[test]
     fn missing_normals_fall_back_to_the_face() {
-        let flat = render(&[big(false)], 30, 30, 0.0);
+        let flat = r(&[big(false)], 30, 30);
         let close = |b: Vec<u8>| flat.iter().zip(&b).all(|(x, y)| x.abs_diff(*y) <= 1);
         for n in [
             [[0.0, 0.0, 1.0]; 3],
             [[0.0, 0.0, -2.0]; 3],                             // either side, any length
             [[0.0, 0.0, 1.0], [0.0; 3], [f32::NAN, 0.0, 0.0]], // given where known, the face elsewhere
         ] {
-            assert!(close(render(&[Tri { n, ..big(false) }], 30, 30, 0.0)), "{n:?}");
+            assert!(close(r(&[Tri { n, ..big(false) }], 30, 30)), "{n:?}");
         }
     }
 
     #[test]
     fn glow_has_a_halo() {
-        let (lit, glow) = (render(&[big(false)], 60, 60, 0.0), render(&[big(true)], 60, 60, 0.0));
+        let (lit, glow) = (r(&[big(false)], 60, 60), r(&[big(true)], 60, 60));
         assert!(premultiplied(&lit) && premultiplied(&glow));
         // the halo reaches past the silhouette, where the plain triangle leaves the background clear
         let halo = lit

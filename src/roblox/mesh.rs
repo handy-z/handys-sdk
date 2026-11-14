@@ -54,6 +54,8 @@ pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
     /// One per position, or empty when unknown.
     pub normals: Vec<[f32; 3]>,
+    /// Texture coordinates, one per position (v down, as Roblox samples them), or empty when unknown.
+    pub uvs: Vec<[f32; 2]>,
     pub tris: Vec<[u32; 3]>,
 }
 
@@ -105,11 +107,12 @@ fn read_vec<T: Pod + Default>(m: &dyn Memory, begin: usize, n: usize) -> Option<
     m.read_slice(begin, &mut v).then_some(v)
 }
 
-fn checked(positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>, tris: Vec<[u32; 3]>) -> Option<Mesh> {
+fn checked(positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>, uvs: Vec<[f32; 2]>, tris: Vec<[u32; 3]>) -> Option<Mesh> {
     let n = positions.len() as u32;
     tris.iter().flatten().all(|i| *i < n).then_some(Mesh {
         positions,
         normals,
+        uvs,
         tris,
     })
 }
@@ -127,6 +130,7 @@ fn mesh_part_mesh(m: &dyn Memory, o: &Offsets, item: usize) -> Option<Mesh> {
     checked(
         verts.iter().map(|v| [v[0], v[1], v[2]]).collect(),
         verts.iter().map(|v| [v[3], v[4], v[5]]).collect(),
+        verts.iter().map(|v| [v[6], v[7]]).collect(),
         tris,
     )
 }
@@ -160,7 +164,8 @@ fn union_mesh(m: &dyn Memory, item: usize) -> Option<Mesh> {
         .then(|| read_vec(m, nb, n))
         .flatten()
         .unwrap_or_default();
-    checked(positions, normals, tris)
+    let uvs = read_vec(m, ub, n).unwrap_or_default();
+    checked(positions, normals, uvs, tris)
 }
 
 /// The decoded meshes for `wanted` ids (id, is_union) from the game's caches: walks each needed provider's LRU once
@@ -299,7 +304,7 @@ mod tests {
         m.put(mesh + UNION_POSITIONS, &[0; UNION_INDICES + 16 - UNION_POSITIONS]);
         put_vec(m, mesh + UNION_POSITIONS, &TRI);
         put_vec(m, mesh + UNION_NORMALS, normals);
-        put_vec(m, mesh + UNION_UVS, &[[0f32; 2]; 3]);
+        put_vec(m, mesh + UNION_UVS, &[[9f32; 2]; 3]);
         put_vec(m, mesh + UNION_INDICES, indices);
         item
     }
@@ -326,6 +331,7 @@ mod tests {
         Mesh {
             positions: TRI.to_vec(),
             normals: UP.to_vec(),
+            uvs: vec![[9.0; 2]; 3], // both kinds fill the slots after the normal with 9s
             tris: vec![[0, 1, 2]],
         }
     }
@@ -392,9 +398,9 @@ mod tests {
         let find = m.reads.get();
         m.reads.set(0);
         cached_meshes(&m, &o, dm, &[(222, true)]);
-        // provider lookup, holder/cache/head, one node, then item, data, mesh, the vector header, three slices (the
-        // normals one is new; positions, tris and normals are separate heap blocks).
-        assert_eq!(m.reads.get(), find + 3 + per_node + 7);
+        // provider lookup, holder/cache/head, one node, then item, data, mesh, the vector header, four slices
+        // (positions, tris, normals and uvs are separate heap blocks).
+        assert_eq!(m.reads.get(), find + 3 + per_node + 8);
     }
 
     #[test]

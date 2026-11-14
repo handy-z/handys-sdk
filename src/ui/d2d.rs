@@ -210,6 +210,30 @@ pub(crate) fn load_image(file: &Path, tint: Option<u32>) -> Option<IWICBitmapSou
     }
 }
 
+/// An image file decoded to a raster Texture (straight-alpha RGBA). None when unreadable.
+pub fn load_texture(file: &Path) -> Option<crate::ui::raster::Texture> {
+    let src = load_image(file, None)?;
+    let (mut w, mut h) = (0u32, 0u32);
+    let mut px = unsafe {
+        src.GetSize(&mut w, &mut h).ok()?;
+        let mut px = vec![0u8; (w as usize).checked_mul(h as usize)?.checked_mul(4)?];
+        src.CopyPixels(std::ptr::null(), w * 4, &mut px).ok()?;
+        px
+    };
+    for p in px.as_chunks_mut::<4>().0 {
+        let [b, g, r, a] = *p;
+        let straight = |c: u8| {
+            if a == 0 {
+                0
+            } else {
+                ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
+            }
+        };
+        *p = [straight(r), straight(g), straight(b), a];
+    }
+    Some(crate::ui::raster::Texture { w, h, rgba: px })
+}
+
 /// Premultiplied BGRA pixels (w x h, 4*w bytes per row) copied into a WIC bitmap. None for no pixels or a short buffer.
 pub(crate) fn pixels_image(w: u32, h: u32, bgra: &[u8]) -> Option<IWICBitmapSource> {
     let len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;

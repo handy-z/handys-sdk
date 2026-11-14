@@ -994,8 +994,6 @@ impl<'a> Dashboard<'a> {
         self.trees.borrow_mut().insert(id, st);
     }
 
-    /// The title bar badge: `text` in the pill after a dot colored by `tone`, `tip` as its hover tooltip (empty text:
-    /// no badge). Repaints only on change.
     /// One muted line in the title bar after the title and badge (e.g. what the app costs the machine), cut at the
     /// minimize button; "" removes it. Repaints only on change.
     pub fn set_title_note(&self, note: &str) {
@@ -1006,6 +1004,13 @@ impl<'a> Dashboard<'a> {
         self.invalidate_caption();
     }
 
+    /// The colors the window draws with now: they follow Windows' light or dark setting, so read them each tick.
+    pub fn theme(&self) -> Theme {
+        self.theme.get()
+    }
+
+    /// The title bar badge: `text` in the pill after a dot colored by `tone`, `tip` as its hover tooltip (empty text:
+    /// no badge). Repaints only on change.
     pub fn set_badge(&self, text: &str, tone: Tone, tip: &str) {
         {
             let mut b = self.badge.borrow_mut();

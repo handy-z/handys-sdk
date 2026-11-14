@@ -98,6 +98,7 @@ const GLOW_BIT: u32 = 1 << 24; // marks a sample's packed color as a glow surfac
 const SHININESS: i32 = 24; // the glint's tightness (Blinn-Phong exponent)
 const SPECULAR: f32 = 0.6; // a full-shine glint's brightness, added to the lit color
 const AURA: f32 = 0.9; // an aura's strength at the silhouette
+const AURA_INSIDE: f32 = 12.0; // from alpha 1/12 a pixel is inside the model (a ForceField body is ~1/5): no aura
 
 /// sRGB 0..1 to linear light (gamma 2.2, close enough for shading).
 fn to_linear(c: f32) -> f32 {
@@ -425,7 +426,8 @@ pub fn aura(bgra: &mut [u8], w: u32, h: u32, rgb: u32) {
     let c = [rgb & 0xff, (rgb >> 8) & 0xff, (rgb >> 16) & 0xff].map(|v| v as f32 / 255.0); // b, g, r
     for (px, m) in bgra.as_chunks_mut::<4>().0.iter_mut().zip(&mask) {
         let ha = (m[0] / 255.0 * AURA * 1.6).min(AURA); // ~half at the silhouette after the blur: lift it back
-        let behind = f32::from(255 - px[3]) / 255.0;
+        // only around the model: a see-through body's faint alpha would let it fill the body, a blur over the fish
+        let behind = (1.0 - f32::from(px[3]) / 255.0 * AURA_INSIDE).max(0.0);
         for k in 0..3 {
             px[k] += (c[k] * ha * 255.0 * behind) as u8;
         }
@@ -663,6 +665,20 @@ mod tests {
         assert!(grew > 20, "{grew}");
         assert_eq!(px(&b, 60, 30, 32), px(&before, 60, 30, 32));
         assert_eq!(px(&b, 60, 0, 0), [0; 4]);
+    }
+
+    #[test]
+    fn aura_leaves_a_see_through_body_clear() {
+        // a ghostly body (alpha ~1/5) must not fill with the glow: it would read as a blur over the fish
+        let mut b = vec![0u8; 60 * 60 * 4];
+        for y in 15..45 {
+            for x in 15..45 {
+                b[(y * 60 + x) * 4..][..4].copy_from_slice(&[10, 10, 10, 50]);
+            }
+        }
+        aura(&mut b, 60, 60, 0x00ff00);
+        assert_eq!(px(&b, 60, 30, 30), [10, 10, 10, 50]);
+        assert!(px(&b, 60, 30, 12)[1] > 0); // still glows just outside
     }
 
     #[test]

@@ -5,7 +5,6 @@
 /// in the same space (an all-zero or non-finite one uses the face normal, so `[[0.0; 3]; 3]` draws it flat), color
 /// 0xRRGGBB, `glow` drawn mostly unlit, brightened and with a soft halo (like Roblox Neon). `tex` is 1 + an index into
 /// render's textures (0 for none), sampled at the corners' `uv` (0..1, v down) and laid over the color by its alpha.
-/// `see_through` ones (like Roblox ForceField) are drawn after the solid ones, faintly over what is behind them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Tri {
     pub p: [[f32; 3]; 3],
@@ -14,7 +13,15 @@ pub struct Tri {
     pub glow: bool,
     pub uv: [[f32; 2]; 3],
     pub tex: u32,
-    pub see_through: bool,
+    /// Corner colors (r, g, b, a) the color is multiplied by, as Roblox tints a mesh's vertex colors by its part's;
+    /// a corner with alpha 0 counts as white (none given).
+    pub vc: [[u8; 4]; 3],
+    /// How see-through, 0 solid to 1 invisible (Roblox Transparency): drawn after the solid ones, over what is behind.
+    pub clear: f32,
+    /// Glossiness 0..1: a white glint where the light reflects toward the camera.
+    pub shine: f32,
+    /// ForceField-like: its see-through surface ripples with Scene::time.
+    pub shimmer: bool,
 }
 
 /// A straight-alpha RGBA image, row-major.
@@ -61,6 +68,8 @@ pub struct Scene {
     pub ambient: [f32; 3],
     pub color: [f32; 3],
     pub dir: [f32; 3],
+    /// Seconds, for surfaces that move (Tri::shimmer); 0 draws a still frame.
+    pub time: f32,
 }
 
 impl Default for Scene {
@@ -72,6 +81,7 @@ impl Default for Scene {
             ambient: [200.0 / 255.0; 3],
             color: [140.0 / 255.0; 3],
             dir: [-1.0, -1.0, -1.0],
+            time: 0.0,
         }
     }
 }
@@ -82,7 +92,18 @@ const MARGIN: f32 = 0.95; // of the slot the model's extent fills
 const HALO_RADIUS: f32 = 0.05; // of the buffer's smaller side
 const HALO: f32 = 1.2; // the blur is about half the color at a silhouette, so the halo starts at ~0.6 of it
 const GLOW_BIT: u32 = 1 << 24; // marks a sample's packed color as a glow surface
-const SEE_THROUGH: f32 = 0.35; // opacity of a see_through surface
+const SHININESS: i32 = 24; // the glint's tightness (Blinn-Phong exponent)
+const SPECULAR: f32 = 0.6; // a full-shine glint's brightness, added to the lit color
+const AURA: f32 = 0.9; // an aura's strength at the silhouette
+
+/// sRGB 0..1 to linear light (gamma 2.2, close enough for shading).
+fn to_linear(c: f32) -> f32 {
+    c.max(0.0).powf(2.2)
+}
+
+fn to_srgb(c: f32) -> f32 {
+    c.max(0.0).powf(1.0 / 2.2)
+}
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
@@ -173,8 +194,8 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
     let mut any_glow = false;
     // solid first: a see-through surface blends over whatever is behind it, so that must be drawn already
     let order = (0..tris.len())
-        .filter(|&i| !tris[i].see_through)
-        .chain((0..tris.len()).filter(|&i| tris[i].see_through));
+        .filter(|&i| tris[i].clear <= 0.0)
+        .chain((0..tris.len()).filter(|&i| tris[i].clear > 0.0));
     for (t, q) in order.map(|i| (&tris[i], &projected[i])) {
         let Some(q) = q else { continue };
         let [a, b, d] = q.map(to_samples);
@@ -209,6 +230,16 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
         });
         let tex = textures.get((t.tex as usize).wrapping_sub(1));
         let base = [16, 8, 0].map(|s| ((t.rgb >> s) & 0xff) as f32 / 255.0);
+        let corner_tint = t.vc.map(|c| {
+            if c[3] == 0 {
+                [1.0; 3]
+            } else {
+                [0, 1, 2].map(|k| f32::from(c[k]) / 255.0)
+            }
+        });
+        let glint = unit([0, 1, 2].map(|k| toward_light[k] + eye[k])).unwrap_or(eye); // the Blinn-Phong half vector
+        let solid = t.clear <= 0.0;
+        let opacity = (1.0 - t.clear).clamp(0.0, 1.0);
         let flag = if t.glow { GLOW_BIT } else { 0 };
         let qs = if persp { [a[2], b[2], d[2]] } else { [1.0; 3] };
         let x0 = a[0].min(b[0]).min(d[0]).floor().max(0.0) as usize;
@@ -232,7 +263,18 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
                 if z <= depth[i] {
                     continue;
                 }
-                if !t.see_through {
+                // a ForceField's ripple: a fine, faint speckle drifting with time (as the game's: no broad bands)
+                let opacity = if t.shimmer {
+                    let (fx, fy) = (x as f32 / SS as f32, y as f32 / SS as f32);
+                    let speckle = (fx * 1.7 + scene.time * 2.0).sin() * (fy * 1.3 - scene.time * 1.6).sin();
+                    opacity * (0.7 + 0.3 * speckle)
+                } else {
+                    opacity
+                };
+                if !solid && opacity < 0.004 {
+                    continue;
+                }
+                if solid {
                     depth[i] = z;
                 }
                 // perspective-correct weights for the attributes
@@ -242,6 +284,9 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
                 let n = [0, 1, 2].map(|k| pw[0] * n0[k] + pw[1] * n1[k] + pw[2] * n2[k]);
                 let diffuse = (dot(n, toward_light) / dot(n, n).sqrt()).max(0.0);
                 let diffuse = if diffuse.is_finite() { diffuse.min(1.0) } else { 0.0 };
+                let tint = [0, 1, 2]
+                    .map(|k| pw[0] * corner_tint[0][k] + pw[1] * corner_tint[1][k] + pw[2] * corner_tint[2][k]);
+                let base = [0, 1, 2].map(|k| base[k] * tint[k]);
                 let albedo = match tex {
                     Some(tex) => {
                         let uv = [0, 1].map(|k| pw[0] * t.uv[0][k] + pw[1] * t.uv[1][k] + pw[2] * t.uv[2][k]);
@@ -250,29 +295,41 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
                     }
                     None => base,
                 };
+                let spec = if t.shine > 0.0 {
+                    let h = (dot(n, glint) / dot(n, n).sqrt()).max(0.0);
+                    if h.is_finite() {
+                        t.shine * SPECULAR * h.powi(SHININESS)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let rgb = [0, 1, 2].map(|k| {
                     let v = if t.glow {
                         let v = albedo[k] * (GLOW_AMBIENT + (1.0 - GLOW_AMBIENT) * diffuse);
                         v + (1.0 - v) * 0.3
                     } else {
-                        albedo[k] * (scene.ambient[k] + scene.color[k] * diffuse)
+                        // lit in linear light, as Roblox does: dark colors stay dark under a bright ambient
+                        let light = to_linear(scene.ambient[k]) + to_linear(scene.color[k]) * diffuse;
+                        to_srgb(to_linear(albedo[k]) * light + spec * (0.5 + to_linear(scene.color[k])))
                     };
                     (v * 255.0).round().clamp(0.0, 255.0) as u32
                 });
                 let packed = flag | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
-                if !t.see_through {
+                if solid {
                     color[i] = packed;
                     cover[i] = 255;
                 } else if cover[i] == 0 {
                     color[i] = packed;
-                    cover[i] = (SEE_THROUGH * 255.0) as u8;
+                    cover[i] = (opacity * 255.0).round().max(1.0) as u8;
                 } else {
                     let mix = |s: u32| {
                         let (a, b) = (((color[i] >> s) & 0xff) as f32, ((packed >> s) & 0xff) as f32);
-                        ((a + (b - a) * SEE_THROUGH).round() as u32) << s
+                        ((a + (b - a) * opacity).round() as u32) << s
                     };
                     color[i] = (color[i] & GLOW_BIT) | flag | mix(16) | mix(8) | mix(0);
-                    cover[i] += (f32::from(255 - cover[i]) * SEE_THROUGH) as u8;
+                    cover[i] += (f32::from(255 - cover[i]) * opacity) as u8;
                 }
             }
         }
@@ -322,6 +379,32 @@ pub fn render(tris: &[Tri], textures: &[Texture], scene: &Scene, w: u32, h: u32)
         }
     }
     out
+}
+
+/// A soft glow of color 0xRRGGBB around what a render drew (its alpha), laid behind it in place: the picture keeps
+/// its edges and the glow fills the clear space near them, fading out over about a tenth of the smaller side.
+pub fn aura(bgra: &mut [u8], w: u32, h: u32, rgb: u32) {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || bgra.len() < w * h * 4 {
+        return;
+    }
+    let mut mask: Vec<[f32; 3]> = bgra
+        .chunks(4)
+        .take(w * h)
+        .map(|p| [f32::from(p[3]), 0.0, 0.0])
+        .collect();
+    let r = ((w.min(h) as f32 * 0.1 / 2.0).round() as usize).max(1);
+    box_blur(&mut mask, w, h, r);
+    box_blur(&mut mask, w, h, r);
+    let c = [rgb & 0xff, (rgb >> 8) & 0xff, (rgb >> 16) & 0xff].map(|v| v as f32 / 255.0); // b, g, r
+    for (px, m) in bgra.as_chunks_mut::<4>().0.iter_mut().zip(&mask) {
+        let ha = (m[0] / 255.0 * AURA * 1.6).min(AURA); // ~half at the silhouette after the blur: lift it back
+        let behind = f32::from(255 - px[3]) / 255.0;
+        for k in 0..3 {
+            px[k] += (c[k] * ha * 255.0 * behind) as u8;
+        }
+        px[3] += (ha * 255.0 * behind) as u8;
+    }
 }
 
 #[cfg(test)]
@@ -455,7 +538,7 @@ mod tests {
     fn see_through_shows_what_is_behind() {
         // a white see-through triangle in front of a blue solid one: bluish, lighter; alone: faint
         let front = Tri {
-            see_through: true,
+            clear: 0.65,
             ..tri([[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 1.0]], 0xffffff, false)
         };
         let back = tri([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]], 0x0000ff, false);
@@ -469,6 +552,75 @@ mod tests {
         let [_, _, _, a] = px(&alone, 40, 20, 22);
         assert!(a > 60 && a < 120, "{a}");
         assert!(premultiplied(&alone));
+    }
+
+    #[test]
+    fn vertex_colors_tint_the_color() {
+        let mut t = big(false);
+        t.rgb = 0xffffff;
+        t.vc = [[255, 0, 0, 255]; 3];
+        let [b, g, red, _] = px(&r(&[t], 30, 30), 30, 15, 16);
+        assert!(red > 150 && g < 10 && b < 10, "{red} {g} {b}");
+        t.vc = [[0; 4]; 3]; // none given: white
+        let [b, g, red, _] = px(&r(&[t], 30, 30), 30, 15, 16);
+        assert!(red > 150 && red == g && g == b, "{red} {g} {b}");
+    }
+
+    #[test]
+    fn shine_adds_a_glint() {
+        // a ball lit from the front: the glossy one is brighter where the light reflects at the camera
+        let dull = sphere(true);
+        let glossy: Vec<Tri> = dull.iter().map(|t| Tri { shine: 1.0, ..*t }).collect();
+        let scene = Scene {
+            dir: [0.0, 0.0, -1.0],
+            ambient: [0.2; 3],
+            color: [0.4; 3], // dim: the default light already whitens a light grey
+            ..Scene::default()
+        };
+        let peak = |m: &[Tri]| {
+            render(m, &[], &scene, 60, 60)
+                .chunks(4)
+                .map(|p| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]))
+                .max()
+                .unwrap()
+        };
+        assert!(peak(&glossy) > peak(&dull) + 60, "{} {}", peak(&glossy), peak(&dull));
+    }
+
+    #[test]
+    fn shimmer_moves_with_time() {
+        let t = Tri {
+            clear: 0.5,
+            shimmer: true,
+            ..big(false)
+        };
+        let at = |time| {
+            let scene = Scene {
+                time,
+                ..Scene::default()
+            };
+            render(&[t], &[], &scene, 40, 40)
+        };
+        let (a, b) = (at(0.0), at(0.5));
+        assert!(a != b && premultiplied(&a) && premultiplied(&b));
+        assert!(a.chunks(4).all(|p| p[3] < 255)); // never solid
+    }
+
+    #[test]
+    fn aura_glows_around_the_model_only() {
+        let mut b = r(&[big(false)], 60, 60);
+        let before = b.clone();
+        aura(&mut b, 60, 60, 0x00ff00);
+        assert!(premultiplied(&b));
+        // the clear space by the edge turns green; the model and far corners stay as they were
+        let grew = before
+            .chunks(4)
+            .zip(b.chunks(4))
+            .filter(|(o, n)| o[3] == 0 && n[3] > 0 && n[1] > n[2])
+            .count();
+        assert!(grew > 20, "{grew}");
+        assert_eq!(px(&b, 60, 30, 32), px(&before, 60, 30, 32));
+        assert_eq!(px(&b, 60, 0, 0), [0; 4]);
     }
 
     #[test]

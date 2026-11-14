@@ -56,6 +56,8 @@ pub struct Mesh {
     pub normals: Vec<[f32; 3]>,
     /// Texture coordinates, one per position (v down, as Roblox samples them), or empty when unknown.
     pub uvs: Vec<[f32; 2]>,
+    /// Vertex colors (r, g, b, a), one per position, or empty when unknown (unions have none).
+    pub colors: Vec<[u8; 4]>,
     pub tris: Vec<[u32; 3]>,
 }
 
@@ -107,12 +109,19 @@ fn read_vec<T: Pod + Default>(m: &dyn Memory, begin: usize, n: usize) -> Option<
     m.read_slice(begin, &mut v).then_some(v)
 }
 
-fn checked(positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>, uvs: Vec<[f32; 2]>, tris: Vec<[u32; 3]>) -> Option<Mesh> {
+fn checked(
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    colors: Vec<[u8; 4]>,
+    tris: Vec<[u32; 3]>,
+) -> Option<Mesh> {
     let n = positions.len() as u32;
     tris.iter().flatten().all(|i| *i < n).then_some(Mesh {
         positions,
         normals,
         uvs,
+        colors,
         tris,
     })
 }
@@ -131,6 +140,8 @@ fn mesh_part_mesh(m: &dyn Memory, o: &Offsets, item: usize) -> Option<Mesh> {
         verts.iter().map(|v| [v[0], v[1], v[2]]).collect(),
         verts.iter().map(|v| [v[3], v[4], v[5]]).collect(),
         verts.iter().map(|v| [v[6], v[7]]).collect(),
+        // the vertex's last 4 bytes: its color
+        verts.iter().map(|v| v[9].to_le_bytes()).collect(),
         tris,
     )
 }
@@ -165,7 +176,7 @@ fn union_mesh(m: &dyn Memory, item: usize) -> Option<Mesh> {
         .flatten()
         .unwrap_or_default();
     let uvs = read_vec(m, ub, n).unwrap_or_default();
-    checked(positions, normals, uvs, tris)
+    checked(positions, normals, uvs, Vec::new(), tris)
 }
 
 /// The decoded meshes for `wanted` ids (id, is_union) from the game's caches: walks each needed provider's LRU once
@@ -332,6 +343,7 @@ mod tests {
             positions: TRI.to_vec(),
             normals: UP.to_vec(),
             uvs: vec![[9.0; 2]; 3], // both kinds fill the slots after the normal with 9s
+            colors: Vec::new(),
             tris: vec![[0, 1, 2]],
         }
     }
@@ -342,7 +354,12 @@ mod tests {
         let dm = world(&mut m, &[0, 1, 2], &UP);
         let got = cached_meshes(&m, &o, dm, &[(111, false), (222, true), (333, false)]);
         assert_eq!(got.len(), 2);
-        assert_eq!(got[&111], tri_mesh());
+        // a MeshPart's vertices end in their color (here the bytes of 9.0); a union has none
+        let colored = Mesh {
+            colors: vec![9f32.to_le_bytes(); 3],
+            ..tri_mesh()
+        };
+        assert_eq!(got[&111], colored);
         assert_eq!(got[&222], tri_mesh());
         // A normal vector of the wrong length still gives the mesh, just without normals.
         let dm = world(&mut m, &[0, 1, 2], &UP[..2]);
@@ -372,7 +389,10 @@ mod tests {
         let p = provider(&mut m, "MeshContentProvider", a);
         let dm = m.instance("DataModel", "Game", &[p]);
         assert!(cached_meshes(&m, &o, dm, &[(3, false)]).is_empty());
-        assert_eq!(cached_meshes(&m, &o, dm, &[(2, false)])[&2], tri_mesh());
+        assert_eq!(
+            cached_meshes(&m, &o, dm, &[(2, false)])[&2].positions,
+            tri_mesh().positions
+        );
     }
 
     #[test]
